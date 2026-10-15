@@ -1,0 +1,8 @@
+Copyright 2012 Google Inc. All Rights Reserved.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is available with a FAQ at: http://scripts.sil.org/OFL
+
+The Noto Sans fonts bundled in this package are from a reMarkable tablet and
+are used under the SIL Open Font License. They are identical to the standard
+Google Noto Sans release.

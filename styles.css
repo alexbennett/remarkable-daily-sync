@@ -1,0 +1,6 @@
+.rmd-status { cursor: pointer; max-width: 32em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rmd-review { width: min(1100px, 92vw); }
+.rmd-review pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24em; overflow-y: auto; }
+.rmd-editor { width: 100%; font-family: var(--font-monospace); resize: vertical; min-height: 20em; }
+.rmd-reasons { white-space: pre-line; border-left: 3px solid var(--color-orange); padding-left: 12px; }
+.rmd-page { width: 100%; max-width: 760px; display: block; margin: 16px auto; border: 1px solid var(--background-modifier-border); }
