@@ -5,6 +5,7 @@ import { dailyDate } from './daily';
 import { buildCandidate, mergeThreeWay } from './merge';
 import { prepareAppend, UnsupportedAppendFormatError } from './append';
 import { CloudRateLimitError } from './transport';
+import { mappingForFile, validateNotebookMappings, selectNotebookEntries, renderNotebook } from './notebooks';
 
 const RENDERED_VERSION = 4;
 const RECOGNITION_VERSION = 6;
@@ -39,9 +40,64 @@ export class SyncEngine {
   private noteByPath(path: string): NoteState | undefined { return Object.values(this.state.notes).find(n => n.path === path); }
   async renamed(oldPath: string, newPath: string): Promise<void> {
     const note = this.noteByPath(oldPath);
-    if (note) { note.path = newPath; await this.persist(); }
+    if (note) {
+      note.path = newPath;
+      note.date = dailyDate(newPath, this.settings().dailyRoot) ?? note.date;
+      await this.persist();
+    }
   }
   async check(): Promise<string[]> { return [await this.transport.check(), await this.recognizer.check()]; }
+
+  /** Enroll folder members without publishing or acknowledging any tablet work. */
+  private async reconcileNotebooks(): Promise<void> {
+    const mappings = this.settings().notebookMappings ?? [];
+    validateNotebookMappings(mappings);
+    for (const mapping of mappings) {
+      let notebook = Object.values(this.state.notebooks).find(n => n.mappingId === mapping.id);
+      if (!notebook) {
+        const id = randomUUID();
+        notebook = this.state.notebooks[id] = { id, mappingId: mapping.id, entryIds: [], generation: 0, pages: [], validation: 'pending' };
+      }
+      const inputs = this.host.files().filter(file => mappingForFile(mappings, file)?.id === mapping.id)
+        .map(file => ({ id: this.noteByPath(file)?.id ?? randomUUID(), path: file, markdown: '', date: dailyDate(file, this.settings().dailyRoot) ?? undefined }));
+      const daily = mapping.folder.replace(/\\/g, '/').startsWith(this.settings().dailyRoot.replace(/\\/g, '/').replace(/\/$/, '') + '/');
+      for (const entry of selectNotebookEntries({ ...mapping, enabled: true }, inputs, { daily })) {
+        if (!this.state.notes[entry.id]) this.state.notes[entry.id] = { id: entry.id, path: entry.path,
+          date: dailyDate(entry.path, this.settings().dailyRoot) ?? 'notebook', revisions: [] };
+        if (!notebook.entryIds.includes(entry.id)) notebook.entryIds.push(entry.id);
+      }
+      // Validation metadata is never an authorization to bypass the writer gate.
+      notebook.validation = 'pending';
+      notebook.pendingReason = 'Persistent tablet notebook updates are not yet validated. Local preview is available; no notebook has been published.';
+    }
+    await this.persist();
+  }
+
+  /** Local-only preview; never uploads, archives, or marks notes published. */
+  async previewNotebook(mappingId: string): Promise<string> {
+    if (this.running || this.stopped) throw new Error('Wait for the current sync to finish before previewing a notebook.');
+    this.running = true;
+    try {
+      await this.reconcileNotebooks();
+      const mappings = this.settings().notebookMappings ?? [];
+      const mapping = mappings.find(m => m.id === mappingId);
+      if (!mapping) throw new Error('Notebook mapping no longer exists.');
+      const notebook = Object.values(this.state.notebooks).find(n => n.mappingId === mappingId)!;
+      const entries = [];
+      for (const id of notebook.entryIds) {
+        const note = this.state.notes[id];
+        if (!note || mappingForFile(mappings, note.path)?.id !== mapping.id) continue;
+        const markdown = await this.host.read(note.path);
+        if (markdown !== null) entries.push({ id, path: note.path, markdown });
+      }
+      if (!entries.length) throw new Error('This folder has no direct Markdown entries to preview.');
+      const rendered = await renderNotebook(this.renderer, mapping.id, entries);
+      const key = `notebook-previews/${notebook.id}-${hash(rendered.pdf).slice(0, 16)}`;
+      const pdfFile = await this.store.write(`${key}.pdf`, rendered.pdf);
+      await this.store.write(`${key}.json`, JSON.stringify(rendered.manifest, null, 2));
+      return this.store.assetPath(pdfFile);
+    } finally { this.running = false; }
+  }
 
   async tick(force = false): Promise<void> {
     if (this.running || this.faulted || this.stopped || (!force && this.settings().paused)) return;
@@ -49,6 +105,7 @@ export class SyncEngine {
     try {
       await this.recoverCommit();
       await this.recoverSavedHandwriting();
+      await this.reconcileNotebooks();
       if (Date.now() < this.cloudRetryAfter) { this.host.status('Cloud rate limited; waiting before retrying automatically'); return; }
       await this.recoverAppend();
       this.host.status('Checking tablet');
@@ -63,6 +120,7 @@ export class SyncEngine {
         }
       }
       for (const file of this.host.files()) {
+        if (mappingForFile(this.settings().notebookMappings ?? [], file)) continue;
         if (this.noteByPath(file)) continue;
         const date = dailyDate(file, this.settings().dailyRoot);
         if (!date || date < this.settings().startDate) continue;
@@ -73,6 +131,8 @@ export class SyncEngine {
       let waitingForRefresh = 0;
       const deferredLayouts: string[] = [];
       for (const note of Object.values(this.state.notes)) {
+        if (mappingForFile(this.settings().notebookMappings ?? [], note.path)) continue;
+        if (note.date === 'notebook') continue;
         if (this.state.reviews.some(r => r.noteId === note.id)) continue;
         const text = await this.host.read(note.path);
         if (text === null) continue;
@@ -91,9 +151,11 @@ export class SyncEngine {
         else await this.finishPublication(note);
       }
       const status = this.state.reviews.length ? `${this.state.reviews.length} to review` : waitingForRefresh ? `Notes synced; ${waitingForRefresh} tablet layout(s) waiting for refresh` : 'Up to date';
-      this.host.status(deferredLayouts.length
+      const notebookCount = (this.settings().notebookMappings ?? []).filter(m => m.enabled).length;
+      const publicationStatus = deferredLayouts.length
         ? `Tablet layout pending for ${deferredLayouts.join(', ')}: cPages append is unsupported. Handwriting imports continue.${this.state.reviews.length ? ` ${status}.` : ''} Turn off history-page appending to publish new PDFs.`
-        : status);
+        : status;
+      this.host.status(notebookCount ? `Synthetic notebooks pending compatibility validation (${notebookCount}); handwriting imports continue. ${publicationStatus}` : publicationStatus);
     } catch (error) {
       if (error instanceof CloudRateLimitError) this.cloudRetryAfter = Date.now() + error.retryAfterMs;
       this.host.status(`Sync stopped: ${(error as Error).message}`);
@@ -139,6 +201,8 @@ export class SyncEngine {
 
   private async publish(note: NoteState, text: string): Promise<void> {
     this.assertActive();
+    if (mappingForFile(this.settings().notebookMappings ?? [], note.path))
+      throw new Error('This note belongs to a synthetic notebook. Persistent notebook publishing is awaiting tablet compatibility validation; use the local notebook preview.');
     this.host.status(`Publishing ${note.date}`);
     const sequence = note.revisions.length + 1;
     // The stable name makes a retry after a cloud success/local crash idempotent.

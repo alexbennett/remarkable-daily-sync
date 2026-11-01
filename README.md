@@ -35,6 +35,16 @@ Keep **Obsidian and Ollama running** on one Windows computer. The reMarkable des
 
 ## Limits and recovery
 
+### Synthetic notebooks (preview only)
+
+Plugin settings can map an explicit folder to one PDF-backed notebook, including all direct Markdown files. **Preview PDF** opens a local combined PDF with each entry starting on a new page. Daily entries sort by date initially; other folders sort naturally by filename. Newly discovered entries follow existing entries.
+
+Persistent tablet notebook publishing is **not enabled**: safe in-place updates to newer `cPages` documents have not been validated. Adding a mapping reserves its folder and suspends individual PDF publication there, including when paused. Existing handwriting imports continue, and unmapped Daily Notes keep their normal sync. Remove the mapping to resume individual Daily Note publication.
+
+Preview creates no tablet documents, archives nothing, and does not acknowledge notes as published. State upgrades keep an exact v1 backup in the private `backups` folder. Local previews and their source manifests live in `notebook-previews`. Do not manually change validation fields to attempt activation; they cannot bypass the transport gate.
+
+### Current sync limits
+
 - Same-document page appending is supported only for legacy PDF metadata. Newer `cPages` documents require the new-PDF workflow above.
 - Avoid inserting, deleting, rotating, or cropping tablet pages. Recognition can make mistakes; test your handwriting before enabling automatic edits.
 - Credentials, original tablet files, sync state, and note backups stay in `%LOCALAPPDATA%\RemarkableDailySync\<vault-hash>`. Do not delete this state to reset the plugin or commit it to Git.

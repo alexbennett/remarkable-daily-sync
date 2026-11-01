@@ -10,6 +10,7 @@ export interface Transport {
   archive(id: string): Promise<void>;
   rename?(id: string, name: string): Promise<CloudDocument>;
   append?(id: string, expectedArchive: Uint8Array, pdf: Uint8Array, content: Uint8Array): Promise<void>;
+  getNotebookWriteCapability?(): { supported: false; reason: string };
   check(): Promise<string>;
 }
 export interface Renderer {
@@ -33,6 +34,18 @@ export interface Settings {
   validatedKinds: Array<ProposedEdit['kind']>; pollSeconds: number;
   manualRefresh?: boolean;
   appendHistory?: boolean;
+  notebookMappings?: NotebookMapping[];
+}
+/** Explicit vault-folder to tablet-notebook mapping; id is stable across renames. */
+export interface NotebookMapping { id: string; folder: string; title: string; enabled: boolean; }
+/** Physical PDF pages are one-based; pageId is the tablet's stable page identity. */
+export interface NotebookPage { pageId: string; pdfPage: number; noteId: string; revisionId: string; }
+export interface NotebookState {
+  id: string; mappingId: string; documentId?: string;
+  entryIds: string[]; generation: number; pages: NotebookPage[];
+  /** Lifecycle metadata only: never overrides the transport's notebook-write gate. */
+  validation: 'pending' | 'validated';
+  pendingReason?: string;
 }
 export interface Revision {
   documentId?: string; firstPage?: number; lastPage?: number;
@@ -48,4 +61,4 @@ export interface ReviewItem {
   suggestions?: ProposedEdit[];
   canValidate?: boolean;
 }
-export interface SyncState { version: 1; notes: Record<string, NoteState>; reviews: ReviewItem[]; }
+export interface SyncState { version: 2; notes: Record<string, NoteState>; reviews: ReviewItem[]; notebooks: Record<string, NotebookState>; }

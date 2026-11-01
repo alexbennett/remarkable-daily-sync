@@ -1,6 +1,8 @@
 import { Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, FileSystemAdapter, App } from 'obsidian';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { normalizeNotebookFolder, validateNotebookMappings } from './notebooks';
 import { LocalStore, hash } from './storage';
 import { today } from './daily';
 import { SyncEngine, type VaultHost } from './engine';
@@ -37,7 +39,7 @@ export default class DailySyncPlugin extends Plugin {
       dailyRoot: 'Daily Notes', startDate: today(),
       cloudFolder: 'Obsidian Daily Notes', rmapiPath: path.join(this.pluginDirectory, 'bin', 'rmapi.exe'),
       ollamaUrl: 'http://localhost:11434', model: 'gemma4:26b', paused: true, automatic: false,
-      validatedKinds: [], pollSeconds: 60, manualRefresh: false,
+      validatedKinds: [], pollSeconds: 60, manualRefresh: false, notebookMappings: [],
     };
     const saved = await this.store.readText('settings.json');
     this.settings = { ...defaults, ...(saved ? JSON.parse(saved) : {}) };
@@ -154,6 +156,40 @@ class DailySyncSettings extends PluginSettingTab {
   display(): void {
     const p = this.plugin, el = this.containerEl; el.empty();
     el.createEl('h2', { text: 'reMarkable Daily Sync' });
+    el.createEl('h3', { text: 'Synthetic notebooks — local preview' });
+    el.createEl('p', { text: 'Map a folder to one notebook, with each direct Markdown file starting on a new page. Tablet publishing is awaiting compatibility validation. Mapped notes stop publishing individual PDFs; existing handwriting still imports. Other notes keep their current sync mode.' });
+    for (const mapping of p.settings.notebookMappings ?? []) {
+      new Setting(el).setName(mapping.title).setDesc(mapping.folder || 'Vault root')
+        .addToggle(t => t.setValue(mapping.enabled).onChange(async enabled => {
+          mapping.enabled = enabled; await p.saveSettings();
+        }))
+        .addButton(b => b.setButtonText('Preview PDF').onClick(async () => {
+          try {
+            const file = await p.engine.previewNotebook(mapping.id);
+            const error = await require('electron').shell.openPath(file);
+            if (error) throw new Error(error);
+          } catch (error) { p.report(error); }
+        }))
+        .addButton(b => b.setButtonText('Remove mapping').onClick(async () => {
+          p.settings.notebookMappings = p.settings.notebookMappings?.filter(m => m.id !== mapping.id);
+          await p.saveSettings(); this.display();
+        }));
+    }
+    let notebookFolder = '', notebookTitle = '';
+    new Setting(el).setName('Folder to map').setDesc('Vault-relative folder; direct Markdown files only.').addText(t => t.onChange(value => { notebookFolder = value; }));
+    new Setting(el).setName('Notebook title').setDesc('Leave empty to use the folder name.').addText(t => t.onChange(value => { notebookTitle = value; }));
+    new Setting(el).setName('Add notebook mapping').setDesc('Preparing a mapping reserves this folder; it does not upload or archive any documents. Removing the mapping restores individual Daily Note publication.').addButton(b => b.setButtonText('Add mapping').onClick(async () => {
+      try {
+        if (!notebookFolder.trim()) throw new Error('Enter a vault-relative folder to map.');
+        const folder = normalizeNotebookFolder(notebookFolder.trim());
+        const item = p.app.vault.getAbstractFileByPath(folder);
+        if (!item || !('children' in item)) throw new Error('Choose an existing folder in this vault.');
+        const mapping = { id: randomUUID(), folder, title: notebookTitle.trim() || folder.split('/').pop()!, enabled: true };
+        const mappings = [...(p.settings.notebookMappings ?? []), mapping];
+        validateNotebookMappings(mappings);
+        p.settings.notebookMappings = mappings; await p.saveSettings(); this.display();
+      } catch (error) { p.report(error); }
+    }));
     el.createEl('p', { text: 'Local Gemma recognition. reMarkable cloud transfers. Settings, credentials, backups, and review images stay on this Windows computer.' });
     el.createEl('p', { text: 'First pair the bundled rMAPI, check connections, and export a disposable validation note. Start with review mode. Connection-setting changes take effect after reloading this plugin.' });
     el.createEl('code', { text: p.store.directory });

@@ -4,7 +4,66 @@ import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { zipSync } from 'fflate';
-import { RmapiTransport, RMAPI_COMMIT, archiveFingerprint, archiveContentHash, appendMappingsPresent, AppendConflictError, CloudRateLimitError, type CommandRunner } from '../src/transport';
+import { RmapiTransport, RMAPI_COMMIT, archiveFingerprint, archiveContentHash, appendMappingsPresent, inspectNotebookCapability, getNotebookWriteCapability, NotebookWriteUnsupportedError, AppendConflictError, CloudRateLimitError, type CommandRunner } from '../src/transport';
+
+test('notebook write capability is permanently gated and makes no helper calls', () => {
+  let calls = 0;
+  const runner: CommandRunner = async () => { calls++; throw new Error('must not run'); };
+  const transport = new RmapiTransport(path.resolve('unused.exe'), path.resolve('unused-state'), 'Daily', runner);
+  assert.deepEqual(transport.getNotebookWriteCapability(), getNotebookWriteCapability());
+  const result = getNotebookWriteCapability();
+  (result as {supported: boolean}).supported = true;
+  assert.equal(getNotebookWriteCapability().supported, false);
+  assert.equal(calls, 0);
+  const error = new NotebookWriteUnsupportedError();
+  assert.equal(error.code, 'NOTEBOOK_WRITE_UNSUPPORTED');
+  assert.equal(error.name, 'NotebookWriteUnsupportedError');
+});
+
+test('offline notebook inspection inventories legacy and CRDT pages without altering archives', () => {
+  for (const content of [
+    {fileType: 'notebook', pages: ['p1']},
+    {fileType: 'notebook', cPages: {pages: [{id: 'p1', idx: {timestamp: '1:2', value: 'ba'}, custom: 'preserve'}]}},
+  ]) {
+    const bytes = zipSync({'doc.content': Buffer.from(JSON.stringify(content)), 'doc/p1.rm': Buffer.from('original tablet ink')});
+    const original = bytes.slice();
+    const inspection = inspectNotebookCapability('doc', bytes);
+    assert.equal(inspection.supported, false);
+    assert.equal(inspection.reason, 'unverified-writer');
+    assert.deepEqual(inspection.pageIds, ['p1']);
+    assert.equal(inspection.fingerprint, archiveFingerprint(bytes));
+    assert.deepEqual(bytes, original);
+  }
+});
+
+test('offline notebook inspection rejects malformed, mixed-document and unsafe archives', () => {
+  const content = Buffer.from(JSON.stringify({fileType: 'notebook', pages: ['p1']}));
+  const archives: Array<Record<string, Uint8Array>> = [
+    {'doc.content': Buffer.from('{invalid secret text')},
+    {'doc.content': content, 'other/p.rm': Buffer.from('ink')},
+    {'doc.content': content, 'doc/../p.rm': Buffer.from('ink')},
+    {'doc.content': Buffer.from(JSON.stringify({fileType: 'notebook', pages: ['p1', 'p1']}))},
+    {'doc.content': Buffer.from(JSON.stringify({fileType: 'notebook', cPages: {pages: [{id: 'p1', idx: {value: 'ba'}}]}}))},
+  ];
+  for (const entries of archives) {
+    const result = inspectNotebookCapability('doc', zipSync(entries));
+    assert.equal(result.reason, 'invalid-archive');
+    assert.ok(!JSON.stringify(result).includes('secret'));
+  }
+  assert.equal(inspectNotebookCapability('../doc', zipSync({'doc.content': content})).reason, 'invalid-archive');
+  assert.equal(inspectNotebookCapability('doc', new Uint8Array([1, 2])).reason, 'invalid-archive');
+  assert.equal(inspectNotebookCapability('doc', zipSync({'doc.content': Buffer.from('{"fileType":"pdf"}')})).reason, 'not-notebook');
+});
+
+test('offline notebook inspection rejects duplicate ZIP members and oversized content', () => {
+  const content = Buffer.from('{"fileType":"notebook","pages":["p1"]}');
+  const archive = Buffer.from(zipSync({'doc.content': content, 'doc/p1.rm': Buffer.from('a'), 'doc/p2.rm': Buffer.from('b')}, {level: 0}));
+  const oldName = Buffer.from('doc/p2.rm');
+  for (let offset = archive.indexOf(oldName); offset !== -1; offset = archive.indexOf(oldName, offset + oldName.length)) Buffer.from('doc/p1.rm').copy(archive, offset);
+  assert.equal(inspectNotebookCapability('doc', archive).reason, 'invalid-archive');
+  const oversized = zipSync({'doc.content': new Uint8Array(8 * 1024 * 1024 + 1)});
+  assert.equal(inspectNotebookCapability('doc', oversized).reason, 'invalid-archive');
+});
 
 test('append recovery verifies CRDT identities without accepting absent legacy arrays', () => {
   const wanted = {cPages: {pages: [{id: 'page-a', idx: {timestamp: '1:2', value: 'ba'}, redir: {timestamp: '1:2', value: 0}}]}};

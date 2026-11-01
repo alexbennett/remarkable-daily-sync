@@ -6,6 +6,59 @@ import { unzipSync } from 'fflate';
 import type { CloudDocument, DownloadedDocument, Transport } from './contracts';
 
 export const RMAPI_COMMIT = 'aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373';
+const NOTEBOOK_WRITE_REASON = 'Native notebook updates are unavailable: the page metadata writer has not been validated on a disposable tablet document. Existing handwriting will not be changed.';
+/** No settings flag can turn an unverified CRDT writer into a supported one. */
+export function getNotebookWriteCapability(): {supported: false; reason: string} {
+  return {supported: false, reason: NOTEBOOK_WRITE_REASON};
+}
+export class NotebookWriteUnsupportedError extends Error {
+  readonly code = 'NOTEBOOK_WRITE_UNSUPPORTED';
+  constructor() { super(NOTEBOOK_WRITE_REASON); this.name = 'NotebookWriteUnsupportedError'; }
+}
+export interface NotebookArchiveInspection {
+  supported: false;
+  reason: 'unverified-writer' | 'not-notebook' | 'invalid-archive';
+  detail: string;
+  format?: 'legacy' | 'cPages';
+  pageIds: string[];
+  fingerprint?: string;
+}
+/** Offline inventory only. Recognizing a shape does not validate its CRDT clocks. */
+export function inspectNotebookCapability(id: string, bytes: Uint8Array): NotebookArchiveInspection {
+  try {
+    if (!id || /[\\/\x00]/.test(id) || id === '.' || id === '..') throw new Error('Invalid document ID.');
+    // Shared limits bound compressed and expanded bytes before JSON is examined.
+    const fingerprint = archiveFingerprint(bytes);
+    const names = new Set<string>();
+    const entries = unzipSync(bytes, {filter: entry => {
+      if (names.has(entry.name) || entry.name.includes('\\') || entry.name.startsWith('/') || entry.name.split('/').some(p => p === '.' || p === '..')) throw new Error('Duplicate or unsafe archive member.');
+      names.add(entry.name);
+      if (!entry.name.endsWith('/') && entry.name !== `${id}.content` && entry.name !== `${id}.metadata` && !entry.name.startsWith(`${id}.`) && !entry.name.startsWith(`${id}/`)) throw new Error('Archive contains a different document.');
+      return true;
+    }});
+    const raw = entries[`${id}.content`];
+    if (!raw || raw.length > 8 * 1024 * 1024) throw new Error('Missing or oversized document content.');
+    const content = JSON.parse(Buffer.from(raw).toString('utf8'));
+    if (!content || typeof content !== 'object' || Array.isArray(content)) throw new Error('Invalid document content.');
+    if (content.fileType !== 'notebook') return {supported: false, reason: 'not-notebook', detail: 'The archive is not a native notebook.', pageIds: [], fingerprint};
+    const format = content.cPages != null ? 'cPages' : 'legacy';
+    const pages = format === 'cPages' ? content.cPages.pages : content.pages;
+    if (!Array.isArray(pages)) throw new Error('Missing notebook page list.');
+    const pageIds: string[] = [];
+    const seenPageIds = new Set<string>();
+    for (const page of pages) {
+      const pageId = format === 'cPages' ? page?.id : page;
+      if (typeof pageId !== 'string' || !pageId || /[\\/\x00]/.test(pageId) || pageId === '.' || pageId === '..' || seenPageIds.has(pageId)) throw new Error('Invalid or duplicate page ID.');
+      if (format === 'cPages' && (typeof page.idx?.value !== 'string' || !page.idx.value || typeof page.idx?.timestamp !== 'string' || !/^\d+:\d+$/.test(page.idx.timestamp))) throw new Error('Invalid CRDT page ordering record.');
+      pageIds.push(pageId);
+      seenPageIds.add(pageId);
+    }
+    return {supported: false, reason: 'unverified-writer', detail: NOTEBOOK_WRITE_REASON, format, pageIds, fingerprint};
+  } catch {
+    // Do not echo raw JSON, filenames, or private notebook content into UI logs.
+    return {supported: false, reason: 'invalid-archive', detail: 'Notebook archive validation failed.', pageIds: []};
+  }
+}
 export type CommandRunner = (binary: string, args: string[], options: {cwd: string; env: NodeJS.ProcessEnv}) => Promise<string>;
 const runCommand: CommandRunner = (binary, args, options) => new Promise((resolve, reject) => {
   execFile(binary, args, { ...options, windowsHide: true, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -70,6 +123,7 @@ export function archiveContentHash(bytes: Uint8Array): string { return archiveDi
 
 /** No shell expansion; all cloud access is limited to one dedicated top-level folder. */
 export class RmapiTransport implements Transport {
+  getNotebookWriteCapability(): {supported: false; reason: string} { return getNotebookWriteCapability(); }
   private folder: string;
   private retryAfter = 0;
   private listedDocs?: CloudDocument[];
