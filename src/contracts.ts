@@ -1,6 +1,6 @@
 export interface SourceBlock { id: string; start: number; end: number; markdown: string; page: number; }
 export interface RenderedNote { pdf: Uint8Array; blocks: SourceBlock[]; pageCount: number; }
-export interface PageImage { page: number; base: string; annotated: string; inkHash: string; changes?: string; }
+export interface PageImage { page: number; pageId?: string; base: string; annotated: string; inkHash: string; changes?: string; }
 export interface CloudDocument { id: string; name: string; parent: string; version: number; modifiedClient: string; contentHash?: string; }
 export interface DownloadedDocument { bytes: Uint8Array; fingerprint: string; }
 export interface Transport {
@@ -11,6 +11,7 @@ export interface Transport {
   rename?(id: string, name: string): Promise<CloudDocument>;
   append?(id: string, expectedArchive: Uint8Array, pdf: Uint8Array, content: Uint8Array): Promise<void>;
   getNotebookWriteCapability?(): { supported: false; reason: string };
+  replaceNotebook?(id: string, expectedArchive: Uint8Array, pdf: Uint8Array, content: Uint8Array, processedInkFiles: string[], gate: { authorizedDocumentId: string }): Promise<void>;
   check(): Promise<string>;
 }
 export interface Renderer {
@@ -42,12 +43,14 @@ export interface NotebookMapping { id: string; folder: string; title: string; en
 export interface NotebookPage { pageId: string; pdfPage: number; noteId: string; revisionId: string; }
 export interface NotebookState {
   id: string; mappingId: string; documentId?: string;
+  pdfFile?: string; format?: string;
   entryIds: string[]; generation: number; pages: NotebookPage[];
   /** Lifecycle metadata only: never overrides the transport's notebook-write gate. */
   validation: 'pending' | 'validated';
   pendingReason?: string;
 }
 export interface Revision {
+  notebookId?: string; pageIds?: string[]; superseded?: boolean;
   documentId?: string; firstPage?: number; lastPage?: number;
   id: string; name: string; baseline: string; blocks: SourceBlock[]; pdfFile: string;
   fingerprint?: string; tabletText: string; archived: boolean; createdAt: string;

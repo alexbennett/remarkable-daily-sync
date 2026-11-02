@@ -183,6 +183,9 @@ test('full PNG pipeline overlays v6 handwriting and retains erased/blank pages',
     const storedPages = await renderer.images(archive(content, { 'doc.pdf': note.pdf }), storedPdf);
     assert.equal(storedPages.length, 2);
     assert.deepEqual(storedPdf, originalBytes);
+    const subset = await renderer.images(archive({fileType:'pdf',cPages:{pages:[{id:'new-identity',redir:{value:1}}]}},{'doc.pdf':note.pdf}),note.pdf);
+    assert.equal(subset.length,1); assert.equal(subset[0].page,2); assert.equal(subset[0].pageId,'new-identity');
+    assert.equal(subset[0].base,storedPages[1].base,'same physical background reused without stale page identity');
     previousAllocations = canvasAllocations;
     const changedPdf = await renderer.render('Review fresh results.\n'.repeat(16), 'Daily');
     const changedPages = await renderer.images(archive(content, { 'doc.pdf': changedPdf.pdf }), changedPdf.pdf);
@@ -284,11 +287,21 @@ test('archive mapping uses PDF redirections, not zip or tablet order', () => {
 
 test('unmapped ink, added pages and transformed layouts fail closed', () => {
   assert.throws(() => archivePages(archive({ fileType: 'pdf', pages: ['first'] }, { 'doc/other.rm': new Uint8Array([1]) }), 1), /Unmapped/);
-  assert.throws(() => archivePages(archive({ fileType: 'pdf', cPages: { pages: [{ id: 'first' }] } }), 1), /Added tablet pages/);
+  assert.deepEqual(archivePages(archive({ fileType: 'pdf', cPages: { pages: [{ id: 'first' }] } }), 1), []); // No PDF background: never guess a source.
   assert.throws(() => archivePages(archive({ fileType: 'pdf', pages: ['first'], transform: { m11: 2 } }), 1), /Transformed/);
   assert.throws(() => archivePages(archive({ fileType: 'pdf', pages: ['first', 'second'], redirectionPageMap: [0, 0] }), 2), /mapping differs/);
   assert.throws(() => archivePages(archive({ fileType: 'pdf', pages: ['first'] }, { 'doc.pdf': new Uint8Array([1]) }), 1, new Uint8Array([2])), /differs from the published baseline/);
   assert.equal(archivePages(archive({ fileType: 'pdf', pages: ['first'] }, { 'doc.pdf': new Uint8Array([1]) }), 1, new Uint8Array([1])).length, 1);
+});
+
+test('cPages redirects select active physical backgrounds and retain ignored ink ownership', () => {
+  const content = { fileType:'pdf',cPages:{pages:[
+    {id:'active',redir:{value:3}}, {id:'removed',redir:{value:0},deleted:{value:1}}, {id:'blank',redir:{value:-1}}
+  ]}};
+  const result = archivePages(archive(content,{'doc/removed.rm':new Uint8Array([1]),'doc/blank.rm':new Uint8Array([2])}),4);
+  assert.deepEqual(result,[{id:'active',page:3,ink:undefined}]);
+  assert.throws(()=>archivePages(archive(content,{'doc/unknown.rm':new Uint8Array([1])}),4),/Unmapped/);
+  assert.throws(()=>archivePages(archive({fileType:'pdf',cPages:{pages:[{id:'same',redir:{value:0}},{id:'same',redir:{value:1}}]}}),2),/duplicate/);
 });
 
 test('pristine PDFs and fully erased v6 pages remain identifiable', () => {

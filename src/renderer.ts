@@ -292,23 +292,38 @@ export function archivePages(archive: Uint8Array, pageCount: number, originalPdf
     }
   }
   let entries: Array<{ id: string; page: number }>;
-  if (Array.isArray(content.cPages?.pages) && content.cPages.pages.length) {
-    entries = content.cPages.pages.map((item: any) => {
-      if (item.deleted?.value) throw new Error('Deleted tablet pages require manual review.');
-      if (!Number.isInteger(item.redir?.value) || item.redir.value < 0)
-        throw new Error('Added tablet pages are unsupported; use the supplied writing page.');
-      return { id: item.id, page: item.redir.value };
-    });
+  const ignoredIds: string[] = [];
+  const cPages = Array.isArray(content.cPages?.pages) && content.cPages.pages.length > 0;
+  if (cPages) {
+    const allIds = content.cPages.pages.map((item: any) => item?.id);
+    if (new Set(allIds).size !== allIds.length || allIds.some((id: unknown) => typeof id !== 'string' || !/^[\w-]+$/.test(id)))
+      throw new Error('Tablet page mapping has invalid or duplicate page IDs.');
+    entries = [];
+    for (const item of content.cPages.pages) {
+      if (item.deleted !== undefined && ![0, 1].includes(item.deleted?.value)) throw new Error('Unknown tablet page deletion marker.');
+      if (item.deleted?.value === 1 || item.redir == null || item.redir?.value === -1) {
+        // Retain ownership of these ink files, but never OCR them against a
+        // different PDF background. The notebook inspector reports unrouted ink.
+        ignoredIds.push(item.id); continue;
+      }
+      if (!Number.isInteger(item.redir?.value) || item.redir.value < 0) throw new Error('Invalid tablet PDF page redirect.');
+      entries.push({id:item.id,page:item.redir.value});
+    }
   } else if (Array.isArray(content.pages) && content.pages.length) {
     entries = content.pages.map((id: string, index: number) => ({ id, page: content.redirectionPageMap?.[index] ?? index }));
   } else if (!Object.keys(files).some(name => name.endsWith('.rm'))) {
     // A pristine uploaded PDF may have no page IDs until opened on the tablet.
     entries = Array.from({ length: pageCount }, (_, page) => ({ id: `pristine-${page}`, page }));
   } else throw new Error('Tablet page mapping is unavailable.');
-  if (entries.length !== pageCount || new Set(entries.map(p => p.page)).size !== pageCount ||
+  if ((!cPages && entries.length !== pageCount) || new Set(entries.map(p => p.page)).size !== entries.length || new Set(entries.map(p => p.id)).size !== entries.length ||
       entries.some(p => !Number.isInteger(p.page) || p.page < 0 || p.page >= pageCount || typeof p.id !== 'string' || !/^[\w-]+$/.test(p.id)))
     throw new Error('Tablet page mapping differs from the published PDF.');
   const used = new Set<string>();
+  for (const id of ignoredIds) {
+    const matches = Object.keys(files).filter(name => name === `${id}.rm` || name.endsWith(`/${id}.rm`));
+    if (matches.length > 1) throw new Error('Duplicate tablet page data.');
+    for (const name of matches) used.add(name);
+  }
   const result = entries.map(entry => {
     const matches = Object.keys(files).filter(name => name === `${entry.id}.rm` || name.endsWith(`/${entry.id}.rm`));
     if (matches.length > 1) throw new Error('Duplicate tablet page data.');
@@ -537,7 +552,7 @@ export class NoteRenderer implements Renderer {
         // and the published PDF must still match, even on a complete hit.
         const cacheKey = `${pdfHash}:${entry.page}:${entry.ink?.length ? hash(entry.ink) : 'no-ink'}`;
         const cached = this.cachedPage(cacheKey);
-        if (cached) { result.push(cached); continue; }
+        if (cached) { result.push({...cached,pageId:entry.id}); continue; }
         const page = await pdf.getPage(entry.page + 1);
         const pageSize = page.getViewport({ scale: 1 });
         const viewport = page.getViewport({ scale: 1404 / pageSize.width });
@@ -581,7 +596,7 @@ export class NoteRenderer implements Renderer {
           }
           changeContext.putImageData(mask, 0, 0); changes = changeCanvas.toDataURL('image/png').split(',')[1];
         } finally { changeCanvas.width = 0; changeCanvas.height = 0; }
-        const image: PageImage = { page: entry.page + 1, base, annotated: canvas.toDataURL('image/png').split(',')[1], inkHash: hash(svg), changes };
+        const image: PageImage = { page: entry.page + 1, pageId: entry.id, base, annotated: canvas.toDataURL('image/png').split(',')[1], inkHash: hash(svg), changes };
         this.rememberPage(cacheKey, image); result.push(image);
         canvas.width = 0; canvas.height = 0;
         page.cleanup();

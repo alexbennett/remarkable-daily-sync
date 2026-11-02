@@ -8,7 +8,7 @@ changes Sync retry exhaustion to return an error. Added files:
 api/sync15/appendpages.go, api/sync15/appendpages_test.go,
 shell/appendpages.go, shell/appendpages_test.go.
 Append recovery requires nonempty verified mappings, including read-only CRDT
-identity/order/redirect checks. CRDT content writes remain unsupported.
+identity/order/redirect checks. Normal CRDT content writes remain disabled.
 Modified upstream files: api/sync15/apictx.go and shell/shell.go.
 Local extension auth-v1 prevents token refresh on non-401 errors, reuses valid
 unexpired tokens, checks atomic token persistence, and releases the legacy
@@ -21,11 +21,19 @@ transport/ratelimit.go are included in the corresponding source archive.
 Local extension cache-v1 exposes the full document file-tree hash as the optional
 contentHash field in JSON ls/find output. Changes: model/document.go,
 api/sync15/blobdoc.go, shell/output.go; corresponding ContentHash tests included.
+Experimental notebook-v1 adds replace-notebook with an explicit matching
+authorized document ID, full expected-file manifest CAS, strict cPages shape
+validation, and scoped processed-ink removal allowlist. Completed retries never
+remove reappearing ink. Unassigned native blank page records and ink remain
+unchanged; bounded alphabetic ordering keys support experimental middle growth.
+Added api/sync15/replacenotebook.go and tests,
+shell/replacenotebook.go and tests; shell/shell.go registers the command.
+This experimental writer is NOT yet validated on physical tablet hardware.
 Dependency source archives and their embedded licenses: dependency-sources/.
 Build: Go 1.23.12 windows/amd64, CGO default, go build -trimpath
-  -ldflags "-X github.com/juruen/rmapi/version.Version=aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373-append-v1-auth-v1-cache-v1"
+  -ldflags "-X github.com/juruen/rmapi/version.Version=aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373-append-v1-auth-v1-cache-v1-notebook-experimental-v1"
 Rebuild script: ../scripts/setup-rmapi.ps1
-Binary SHA256: aab297b2dfcf1342ef08b250da5fc5631371c7ec39b0db92d47c277d437a8b32
+Binary SHA256: 7319b981efb9f128107a5a4f8dc6c64f728eef4239ed209138a453d3963635e9
 
 The helper is a separate command-line program. Guarded append was verified
 against a disposable cloud document: same ID, appended pages, unchanged other

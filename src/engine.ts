@@ -6,6 +6,7 @@ import { buildCandidate, mergeThreeWay } from './merge';
 import { prepareAppend, UnsupportedAppendFormatError } from './append';
 import { CloudRateLimitError } from './transport';
 import { mappingForFile, validateNotebookMappings, selectNotebookEntries, renderNotebook } from './notebooks';
+import { NotebookSync } from './notebook-sync';
 
 const RENDERED_VERSION = 4;
 const RECOGNITION_VERSION = 6;
@@ -31,8 +32,15 @@ export class SyncEngine {
   private pageRecognition = new Map<string, { result: Interpretation; bytes: number }>();
   private pageRecognitionBytes = 0;
   private pullCache = new Map<string, { downloaded: DownloadedDocument; pages?: PageImage[] }>();
+  private notebookSync: NotebookSync;
   constructor(readonly state: SyncState, private settings: () => Settings, private host: VaultHost,
-    private store: LocalStore, private transport: Transport, private renderer: Renderer, private recognizer: Recognizer) {}
+    private store: LocalStore, private transport: Transport, private renderer: Renderer, private recognizer: Recognizer,
+    private authorizeNotebook: (documentId: string | undefined, format: string) => boolean = () => false) {
+    this.notebookSync = new NotebookSync(state, settings, host, store, transport, renderer, {
+      pull: async (note, revision) => { this.pullCache.delete(remoteId(revision)); await this.pull(note, revision); },
+      authorize: authorizeNotebook, assertActive: () => this.assertActive(),
+    });
+  }
 
   private async persist(): Promise<void> { await this.store.save(this.state); }
   stop(): void { this.stopped = true; }
@@ -67,8 +75,10 @@ export class SyncEngine {
         if (!notebook.entryIds.includes(entry.id)) notebook.entryIds.push(entry.id);
       }
       // Validation metadata is never an authorization to bypass the writer gate.
-      notebook.validation = 'pending';
-      notebook.pendingReason = 'Persistent tablet notebook updates are not yet validated. Local preview is available; no notebook has been published.';
+      if (!this.authorizeNotebook(notebook.documentId, notebook.documentId ? notebook.format ?? 'cPages-v2' : 'create')) {
+        notebook.validation = 'pending';
+        notebook.pendingReason = 'Persistent tablet notebook updates are not yet validated. Local preview is available.';
+      }
     }
     await this.persist();
   }
@@ -108,6 +118,7 @@ export class SyncEngine {
       await this.reconcileNotebooks();
       if (Date.now() < this.cloudRetryAfter) { this.host.status('Cloud rate limited; waiting before retrying automatically'); return; }
       await this.recoverAppend();
+      await this.notebookSync.recover();
       this.host.status('Checking tablet');
       const cloud = await this.transport.list();
       const ids = new Set(cloud.map(d => d.id));
@@ -115,6 +126,7 @@ export class SyncEngine {
         note.missing = (await this.host.read(note.path)) === null;
         if (note.missing) continue;
         for (const rev of note.revisions) {
+          if (rev.superseded) continue;
           if (!ids.has(remoteId(rev))) continue; // Remote deletions never delete local text.
           await this.pull(note, rev);
         }
@@ -128,6 +140,7 @@ export class SyncEngine {
         this.state.notes[note.id] = note;
       }
       await this.persist();
+      await this.notebookSync.sync();
       let waitingForRefresh = 0;
       const deferredLayouts: string[] = [];
       for (const note of Object.values(this.state.notes)) {
@@ -151,11 +164,11 @@ export class SyncEngine {
         else await this.finishPublication(note);
       }
       const status = this.state.reviews.length ? `${this.state.reviews.length} to review` : waitingForRefresh ? `Notes synced; ${waitingForRefresh} tablet layout(s) waiting for refresh` : 'Up to date';
-      const notebookCount = (this.settings().notebookMappings ?? []).filter(m => m.enabled).length;
+      const notebookPending = Object.values(this.state.notebooks).filter(n => n.pendingReason && this.settings().notebookMappings?.some(m => m.id === n.mappingId && m.enabled));
       const publicationStatus = deferredLayouts.length
         ? `Tablet layout pending for ${deferredLayouts.join(', ')}: cPages append is unsupported. Handwriting imports continue.${this.state.reviews.length ? ` ${status}.` : ''} Turn off history-page appending to publish new PDFs.`
         : status;
-      this.host.status(notebookCount ? `Synthetic notebooks pending compatibility validation (${notebookCount}); handwriting imports continue. ${publicationStatus}` : publicationStatus);
+      this.host.status(notebookPending.length ? `Synthetic notebooks (${notebookPending.length} pending): ${notebookPending[0].pendingReason} ${publicationStatus}` : publicationStatus);
     } catch (error) {
       if (error instanceof CloudRateLimitError) this.cloudRetryAfter = Date.now() + error.retryAfterMs;
       this.host.status(`Sync stopped: ${(error as Error).message}`);
@@ -176,7 +189,7 @@ export class SyncEngine {
       // Pull every revision first so an explicit layout refresh includes the
       // latest cloud handwriting and cannot bypass a pending conflict review.
       const ids = new Set((await this.transport.list()).map(d => d.id));
-      for (const rev of note.revisions) if (ids.has(remoteId(rev))) await this.pull(note, rev);
+      for (const rev of note.revisions) if (!rev.superseded && ids.has(remoteId(rev))) await this.pull(note, rev);
       if (this.state.reviews.some(r => r.noteId === note.id)) throw new Error('Review pending tablet changes before refreshing this layout.');
       const text = await this.host.read(file);
       if (text === null) throw new Error('Note moved or was deleted.');
@@ -273,8 +286,15 @@ export class SyncEngine {
     await this.store.write(`originals/${rev.id}/${downloaded.fingerprint}.rmdoc`, downloaded.bytes);
     this.host.status(`Rendering tablet pages for ${note.date}`);
     cached.pages ??= await this.renderer.images(downloaded.bytes, await this.store.read(rev.pdfFile));
-    const pages = cached.pages
-      .filter(page => page.page >= (rev.firstPage ?? 1) && page.page <= (rev.lastPage ?? Infinity));
+    const pages = cached.pages.filter(page => rev.pageIds
+      ? !!page.pageId && rev.pageIds.includes(page.pageId)
+      : page.page >= (rev.firstPage ?? 1) && page.page <= (rev.lastPage ?? Infinity));
+    if (rev.notebookId && rev.pageIds) {
+      const notebook = this.state.notebooks[rev.notebookId];
+      if (!notebook || pages.length !== rev.pageIds.length || pages.some(page => !notebook.pages.some(p =>
+        p.pageId === page.pageId && p.pdfPage === page.page && p.noteId === note.id && p.revisionId === rev.id)))
+        throw new Error('Notebook page identities changed; preserving handwriting until its source mapping is reconciled.');
+    }
     const pageHash = hash(pages.map(p => `${p.page}:${p.inkHash}`).join('|'));
     const previous = await this.store.readText(`ink/${rev.id}.json`);
     if (previous === JSON.stringify({ pageHash, tabletHash: hash(rev.tabletText) })) {

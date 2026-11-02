@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { zipSync } from 'fflate';
-import { RmapiTransport, RMAPI_COMMIT, archiveFingerprint, archiveContentHash, appendMappingsPresent, inspectNotebookCapability, getNotebookWriteCapability, NotebookWriteUnsupportedError, AppendConflictError, CloudRateLimitError, type CommandRunner } from '../src/transport';
+import { RmapiTransport, RMAPI_COMMIT, archiveFingerprint, archiveContentHash, appendMappingsPresent, inspectNotebookCapability, getNotebookWriteCapability, NotebookWriteUnsupportedError, NotebookUpdateConflictError, AppendConflictError, CloudRateLimitError, type CommandRunner } from '../src/transport';
 
 test('notebook write capability is permanently gated and makes no helper calls', () => {
   let calls = 0;
@@ -18,6 +18,46 @@ test('notebook write capability is permanently gated and makes no helper calls',
   const error = new NotebookWriteUnsupportedError();
   assert.equal(error.code, 'NOTEBOOK_WRITE_UNSUPPORTED');
   assert.equal(error.name, 'NotebookWriteUnsupportedError');
+});
+
+test('experimental notebook update gates document, passes explicit ink allowlist, and preserves later ink', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'rmapi-notebook-test-'));
+  const oldContent = Buffer.from('{"old":true}'), content = Buffer.from('{"new":true}'), pdf = Buffer.from('%PDF-new');
+  const baseline = zipSync({'doc.pdf': Buffer.from('%PDF-old'), 'doc.content': oldContent, 'doc/p1.rm': Buffer.from('processed ink')});
+  let marker = 'NOTEBOOK_OK', calls = 0, writes = 0, corrupt = false;
+  const runner: CommandRunner = async (_binary, args, options) => {
+    calls++;
+    if (args.includes('ls')) return JSON.stringify([root]);
+    if (args.includes('find')) return JSON.stringify([root, node('doc', 'disposable', root.id)]);
+    if (args.includes('replace-notebook')) {
+      writes++;
+      assert.deepEqual(args, ['-ni', 'replace-notebook', '--id', 'doc', '--authorized-document-id', 'doc', '--expected-archive', 'expected.rmdoc', '--pdf', 'updated.pdf', '--content', 'updated.content', '--remove-manifest', 'processed-ink.json']);
+      assert.deepEqual(JSON.parse(await readFile(path.join(options.cwd, 'processed-ink.json'), 'utf8')), ['doc/p1.rm']);
+      assert.deepEqual(new Uint8Array(await readFile(path.join(options.cwd, 'expected.rmdoc'))), baseline);
+      return marker;
+    }
+    if (args.includes('get')) {
+      await writeFile(path.join(options.cwd, 'disposable.rmdoc'), zipSync({'doc.pdf': pdf, 'doc.content': corrupt ? oldContent : content, 'doc/p1.rm': Buffer.from('newer ink must remain')}));
+      return 'OK';
+    }
+    throw new Error('unexpected command');
+  };
+  try {
+    const t = new RmapiTransport(path.join(dir, 'rmapi.exe'), dir, 'Daily', runner);
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, content, ['doc/p1.rm'], {authorizedDocumentId:'other'}), /authorization mismatch/);
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, content, ['doc/other.rm'], {authorizedDocumentId:'doc'}), /allowlist/);
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, oldContent, [], {authorizedDocumentId:'doc'}), /must change/);
+    assert.equal(calls, 0);
+    await t.replaceNotebook('doc', baseline, pdf, content, ['doc/p1.rm'], {authorizedDocumentId:'doc'});
+    marker = 'NOTEBOOK_CONFLICT';
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, content, ['doc/p1.rm'], {authorizedDocumentId:'doc'}), NotebookUpdateConflictError);
+    marker = 'unknown';
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, content, ['doc/p1.rm'], {authorizedDocumentId:'doc'}), /not confirmed/);
+    marker = 'NOTEBOOK_OK'; corrupt = true;
+    await assert.rejects(t.replaceNotebook('doc', baseline, pdf, content, ['doc/p1.rm'], {authorizedDocumentId:'doc'}), /retain recovery journal/);
+    assert.equal(writes, 4);
+    assert.equal(t.getNotebookWriteCapability().supported, false);
+  } finally { await rm(dir, {recursive: true, force: true}); }
 });
 
 test('offline notebook inspection inventories legacy and CRDT pages without altering archives', () => {

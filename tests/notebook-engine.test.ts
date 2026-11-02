@@ -56,7 +56,7 @@ test('mapped folders enroll all dates, reserve paused mappings, and leave unmapp
   assert.equal(s.stats().uploads, 1);
   assert.equal(Object.values(s.state.notes).find(n => n.path === outsidePath)!.revisions.length, 1);
   assert.ok(notebook.entryIds.every(id => s.state.notes[id].revisions.length === 0));
-  assert.match(s.statuses.at(-1)!, /pending compatibility validation/);
+  assert.match(s.statuses.at(-1)!, /awaiting.*validation/);
   s.settings.notebookMappings![0].enabled = false;
   s.files.set(recentPath, 'changed while mapping paused');
   await s.engine.tick();
@@ -123,3 +123,4 @@ test('notebook preview cannot interleave with an active cloud sync', async t => 
   finally { release(); await ticking; }
   assert.ok(await s.engine.previewNotebook('october'));
 });
+

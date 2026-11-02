@@ -9,9 +9,10 @@ $outputPath = [IO.Path]::GetFullPath((Join-Path $OutputDirectory 'rmapi.exe'))
 Expand-Archive -LiteralPath (Join-Path $PSScriptRoot '../bin/rmapi-source.zip') -DestinationPath (Join-Path $buildDirectory 'source')
 Push-Location (Join-Path $buildDirectory 'source')
 try {
-  & go test . ./api ./auth ./config ./transport ./api/sync15 ./shell -run 'Authentication|Unexpired|RateLimit|RetryAfter|SaveTokens|AuthFailure|Append|Unvisited|ContentHash'
+  & go test . ./api ./auth ./config ./transport ./api/sync15 ./shell -run 'Authentication|Unexpired|RateLimit|RetryAfter|SaveTokens|AuthFailure|Append|Notebook|Unvisited|ContentHash'
   if ($LASTEXITCODE -ne 0) { throw 'Guarded append tests failed.' }
-  & go build -trimpath -ldflags "-X github.com/juruen/rmapi/version.Version=$revision-append-v1-auth-v1-cache-v1" -o $outputPath .
+  & go build -trimpath -ldflags "-X github.com/juruen/rmapi/version.Version=$revision-append-v1-auth-v1-cache-v1-notebook-experimental-v1" -o $outputPath .
   if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 } finally { Pop-Location }
 Write-Output "Built $outputPath from $revision. Source retained at $buildDirectory."
+

@@ -21,6 +21,7 @@ export default class DailySyncPlugin extends Plugin {
   private pluginDirectory!: string;
   private disposed = false;
   requiresReload = false;
+  notebookValidated = false;
   lastStatus = 'Paused — finish setup';
 
   async onload(): Promise<void> {
@@ -43,6 +44,16 @@ export default class DailySyncPlugin extends Plugin {
     };
     const saved = await this.store.readText('settings.json');
     this.settings = { ...defaults, ...(saved ? JSON.parse(saved) : {}) };
+    const notebookEvidence = await this.store.readText('notebook-compatibility.json');
+    if (notebookEvidence) {
+      try {
+        const evidence = JSON.parse(notebookEvidence);
+        this.notebookValidated = evidence.writerVersion === 'cpages-experimental-v1' &&
+          typeof evidence.documentId === 'string' && /^[0-9a-f-]{36}$/.test(evidence.documentId) &&
+          typeof evidence.confirmedAt === 'string' && Number.isFinite(Date.parse(evidence.confirmedAt)) &&
+          ['refresh', 'append', 'grow', 'shrink', 'tablet-roundtrip'].every(name => evidence.scenarios?.includes(name));
+      } catch { this.notebookValidated = false; }
+    }
     await this.saveSettings();
     const host: VaultHost = {
       writeAttachment: async (filePath, bytes) => {
@@ -80,7 +91,7 @@ export default class DailySyncPlugin extends Plugin {
     const cloud = () => cloudClient ??= new RmapiTransport(activeSettings.rmapiPath, directory, activeSettings.cloudFolder);
     const model = () => new OllamaRecognizer(activeSettings.ollamaUrl, activeSettings.model);
     this.engine = new SyncEngine(state, () => this.settings, host, this.store,
-      { list: () => cloud().list(), download: id => cloud().download(id), upload: (name, pdf) => cloud().upload(name, pdf), append: (id, expected, pdf, content) => cloud().append(id, expected, pdf, content), archive: id => cloud().archive(id), rename: (id, name) => cloud().rename(id, name), check: () => cloud().check() },
+      { list: () => cloud().list(), download: id => cloud().download(id), upload: (name, pdf) => cloud().upload(name, pdf), append: (id, expected, pdf, content) => cloud().append(id, expected, pdf, content), replaceNotebook: (id, expected, pdf, content, files, gate) => cloud().replaceNotebook(id, expected, pdf, content, files, gate), archive: id => cloud().archive(id), rename: (id, name) => cloud().rename(id, name), check: () => cloud().check() },
       new NoteRenderer({ fontData, resolveImage: async filePath => {
         if (!/^reMarkable Attachments\/[a-f0-9]{64}\.png$/.test(filePath)) throw new Error('Invalid drawing image path.');
         const file = this.app.vault.getAbstractFileByPath(filePath);
@@ -89,7 +100,8 @@ export default class DailySyncPlugin extends Plugin {
         if (!filePath.endsWith(`${hash(bytes)}.png`)) throw new Error('Drawing attachment changed; restore the original image before publishing.');
         return bytes;
       } }),
-      { check: () => model().check(), interpret: (pages, blocks, baseline) => model().interpret(pages, blocks, baseline) });
+      { check: () => model().check(), interpret: (pages, blocks, baseline) => model().interpret(pages, blocks, baseline) },
+      (_id, format) => this.notebookValidated && ['create', 'cPages-v2'].includes(format));
     this.addSettingTab(new DailySyncSettings(this.app, this));
     this.addRibbonIcon('tablet', 'reMarkable Daily Sync', () => this.openReviews());
     this.addCommand({ id: 'review-changes', name: 'Review tablet changes', callback: () => this.openReviews() });
@@ -156,8 +168,8 @@ class DailySyncSettings extends PluginSettingTab {
   display(): void {
     const p = this.plugin, el = this.containerEl; el.empty();
     el.createEl('h2', { text: 'reMarkable Daily Sync' });
-    el.createEl('h3', { text: 'Synthetic notebooks — local preview' });
-    el.createEl('p', { text: 'Map a folder to one notebook, with each direct Markdown file starting on a new page. Tablet publishing is awaiting compatibility validation. Mapped notes stop publishing individual PDFs; existing handwriting still imports. Other notes keep their current sync mode.' });
+    el.createEl('h3', { text: 'Synthetic notebooks' });
+    el.createEl('p', { text: p.notebookValidated ? 'Selected folders sync to persistent tablet notebooks. Open each newly uploaded notebook on the tablet once and let it sync to initialize its page identities. Handwriting is saved before its entry refreshes.' : 'Persistent notebook updates require a completed disposable-tablet compatibility test. Local previews are available. Mapped notes stop publishing individual PDFs; existing handwriting still imports. Other notes keep their current sync mode.' });
     for (const mapping of p.settings.notebookMappings ?? []) {
       new Setting(el).setName(mapping.title).setDesc(mapping.folder || 'Vault root')
         .addToggle(t => t.setValue(mapping.enabled).onChange(async enabled => {

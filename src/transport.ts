@@ -15,6 +15,9 @@ export class NotebookWriteUnsupportedError extends Error {
   readonly code = 'NOTEBOOK_WRITE_UNSUPPORTED';
   constructor() { super(NOTEBOOK_WRITE_REASON); this.name = 'NotebookWriteUnsupportedError'; }
 }
+export class NotebookUpdateConflictError extends Error {
+  constructor() { super('Tablet changed during notebook update. Synchronize its latest handwriting before retrying.'); this.name = 'NotebookUpdateConflictError'; }
+}
 export interface NotebookArchiveInspection {
   supported: false;
   reason: 'unverified-writer' | 'not-notebook' | 'invalid-archive';
@@ -276,6 +279,36 @@ export class RmapiTransport implements Transport {
       const current = JSON.parse(Buffer.from(actual[`${id}.content`] ?? []).toString('utf8'));
       if (!appendMappingsPresent(wanted, current)) throw new Error('Appended page mappings could not be verified.');
     } finally { await rm(dir, { recursive: true, force: true }); }
+  }
+  /** Experimental entry point. Normal feature capability remains disabled until tablet validation. */
+  async replaceNotebook(id: string, expectedArchive: Uint8Array, pdf: Uint8Array, content: Uint8Array, processedInkFiles: string[], gate: {authorizedDocumentId: string}): Promise<void> {
+    if (!id || gate?.authorizedDocumentId !== id) throw new Error('Experimental notebook document authorization mismatch.');
+    archiveFingerprint(expectedArchive);
+    const expected = unzipSync(expectedArchive);
+    const pdfName = `${id}.pdf`, contentName = `${id}.content`;
+    if (!expected[pdfName] || !expected[contentName]) throw new Error('Notebook baseline archive does not belong to the requested document.');
+    if (sha(expected[contentName]) === sha(content)) throw new Error('Notebook content must change for reliable recovery.');
+    const removalSet = new Set<string>();
+    for (const file of processedInkFiles) {
+      if (!file.startsWith(`${id}/`) || !/^[^/\\]+\.rm$/.test(file.slice(id.length + 1)) || !expected[file] || removalSet.has(file)) throw new Error('Invalid processed ink allowlist.');
+      removalSet.add(file);
+    }
+    const {root, nodes} = await this.tree();
+    if (!root || !nodes.some(n => n.id === id && n.parent === root.id && n.type === 'DocumentType')) throw new Error('Only an active managed document can receive an experimental notebook update.');
+    const dir = await mkdtemp(path.join(this.stateDir, 'notebook-'));
+    try {
+      await writeFile(path.join(dir, 'expected.rmdoc'), expectedArchive, {flag: 'wx'});
+      await writeFile(path.join(dir, 'updated.pdf'), pdf, {flag: 'wx'});
+      await writeFile(path.join(dir, 'updated.content'), content, {flag: 'wx'});
+      await writeFile(path.join(dir, 'processed-ink.json'), JSON.stringify(processedInkFiles), {flag: 'wx'});
+      const output = await this.command(['replace-notebook', '--id', id, '--authorized-document-id', gate.authorizedDocumentId, '--expected-archive', 'expected.rmdoc', '--pdf', 'updated.pdf', '--content', 'updated.content', '--remove-manifest', 'processed-ink.json'], dir);
+      if (output.split(/\r?\n/).includes('NOTEBOOK_CONFLICT')) throw new NotebookUpdateConflictError();
+      if (!output.split(/\r?\n/).includes('NOTEBOOK_OK')) throw new Error('Experimental notebook update was not confirmed.');
+      const actual = unzipSync((await this.download(id)).bytes);
+      if (!actual[pdfName] || !actual[contentName] || sha(actual[pdfName]) !== sha(pdf) || sha(actual[contentName]) !== sha(content)) throw new Error('Notebook update outcome could not be verified; retain recovery journal.');
+      // Do not assert removed ink stays absent: the tablet may have written new
+      // ink since commit. The helper performs no removal on committed retries.
+    } finally { await rm(dir, {recursive: true, force: true}); }
   }
   async rename(id: string, name: string): Promise<CloudDocument> {
     safeName(name);
