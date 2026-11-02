@@ -2,7 +2,7 @@ import { Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, FileSystemAdap
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { normalizeNotebookFolder, validateNotebookMappings } from './notebooks';
+import { mappingForFile, normalizeNotebookFolder, validateNotebookMappings } from './notebooks';
 import { LocalStore, hash } from './storage';
 import { today } from './daily';
 import { SyncEngine, type VaultHost } from './engine';
@@ -51,7 +51,7 @@ export default class DailySyncPlugin extends Plugin {
         this.notebookValidated = evidence.writerVersion === 'cpages-experimental-v1' &&
           typeof evidence.documentId === 'string' && /^[0-9a-f-]{36}$/.test(evidence.documentId) &&
           typeof evidence.confirmedAt === 'string' && Number.isFinite(Date.parse(evidence.confirmedAt)) &&
-          ['refresh', 'append', 'grow', 'shrink', 'tablet-roundtrip'].every(name => evidence.scenarios?.includes(name));
+          ['refresh', 'append', 'grow', 'shrink', 'legacy', 'tablet-roundtrip'].every(name => evidence.scenarios?.includes(name));
       } catch { this.notebookValidated = false; }
     }
     await this.saveSettings();
@@ -101,7 +101,7 @@ export default class DailySyncPlugin extends Plugin {
         return bytes;
       } }),
       { check: () => model().check(), interpret: (pages, blocks, baseline) => model().interpret(pages, blocks, baseline) },
-      (_id, format) => this.notebookValidated && ['create', 'cPages-v2'].includes(format));
+      (_id, format) => this.notebookValidated && ['create', 'legacy', 'cPages-v2'].includes(format));
     this.addSettingTab(new DailySyncSettings(this.app, this));
     this.addRibbonIcon('tablet', 'reMarkable Daily Sync', () => this.openReviews());
     this.addCommand({ id: 'review-changes', name: 'Review tablet changes', callback: () => this.openReviews() });
@@ -147,6 +147,10 @@ export default class DailySyncPlugin extends Plugin {
       const file = this.app.workspace.getActiveFile();
       if (!file || file.extension !== 'md') throw new Error('Open the Daily Note you want to refresh first.');
       await this.engine.refreshTablet(file.path);
+      if (mappingForFile(this.settings.notebookMappings ?? [], file.path)) {
+        new Notice('Notebook sync checked. Queued entry updates continue automatically.');
+        return;
+      }
       new Notice(this.settings.appendHistory ? 'Updated note appended to the existing tablet document. Earlier pages and handwriting are preserved.' : 'Tablet layout refreshed. Open the date-named PDF to continue; previous handwriting remains in Archive.', 12000);
     } catch (e) { this.report(e); }
   }

@@ -149,7 +149,7 @@ export class SyncEngine {
         if (this.state.reviews.some(r => r.noteId === note.id)) continue;
         const text = await this.host.read(note.path);
         if (text === null) continue;
-        if (note.lastPublishedHash !== hash(text) || note.renderedVersion !== RENDERED_VERSION) {
+        if (note.lastPublishedHash !== hash(text) || note.renderedVersion !== RENDERED_VERSION || note.revisions.at(-1)?.notebookId) {
           if (this.settings().manualRefresh && note.revisions.length) waitingForRefresh++;
           else {
             try { await this.publish(note, text); }
@@ -193,6 +193,15 @@ export class SyncEngine {
       if (this.state.reviews.some(r => r.noteId === note.id)) throw new Error('Review pending tablet changes before refreshing this layout.');
       const text = await this.host.read(file);
       if (text === null) throw new Error('Note moved or was deleted.');
+      const mapping = mappingForFile(this.settings().notebookMappings ?? [], file);
+      if (mapping) {
+        if (!mapping.enabled) throw new Error('This synthetic notebook is paused.');
+        await this.notebookSync.sync();
+        const notebook = Object.values(this.state.notebooks).find(n => n.mappingId === mapping.id);
+        if (notebook?.pendingReason) throw new Error(notebook.pendingReason);
+        this.host.status('Notebook sync checked; queued entry changes continue on the next sync.');
+        return;
+      }
       if (note.lastPublishedHash !== hash(text) || note.renderedVersion !== RENDERED_VERSION) await this.publish(note, text);
       else await this.finishPublication(note);
       this.host.status('Tablet layout refreshed');
@@ -221,7 +230,7 @@ export class SyncEngine {
     // The stable name makes a retry after a cloud success/local crash idempotent.
     const name = `${note.date} - ${note.id.slice(0, 8)} - r${String(sequence).padStart(4, '0')} - ${hash(text).slice(0, 12)} - p${RENDERED_VERSION}`;
     const rendered = await this.renderer.render(text, note.path.split('/').pop()!.replace(/\.md$/, ''));
-    const previous = note.revisions.at(-1);
+    const previous = note.revisions.filter(revision => !revision.notebookId).at(-1);
     if (this.settings().appendHistory && previous) {
       if (!this.transport.append) throw new Error('Install the page-append cloud helper before enabling history pages.');
       const downloaded = await this.transport.download(remoteId(previous));
@@ -255,8 +264,9 @@ export class SyncEngine {
   // after interruption uses the same documents and never replaces tablet ink.
   private async finishPublication(note: NoteState): Promise<void> {
     const latest = note.revisions.at(-1);
-    if (!latest) return;
+    if (!latest || latest.notebookId) return;
     for (const prior of note.revisions.slice(0, -1)) {
+      if (prior.notebookId) continue; // A shared notebook belongs to multiple notes.
       if (remoteId(prior) === remoteId(latest)) continue;
       if (prior.archived) continue;
       this.assertActive();

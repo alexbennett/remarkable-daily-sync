@@ -42,6 +42,8 @@ export async function prepareCPagesUpdate(archive: Uint8Array, newPdf: Uint8Arra
   const documentId = pdfNames[0].slice(0,-4);
   if (!UUID.test(documentId)) fail('invalid document UUID');
   const content = JSON.parse(strFromU8(files[contentNames[0]]));
+  if (object(content) && content.fileType === 'pdf' && (content.formatVersion === undefined || content.formatVersion === 1) && content.cPages === undefined)
+    return prepareLegacyUpdate(archive,newPdf,options,content,files[pdfNames[0]],documentId,names);
   if (!object(content) || content.fileType !== 'pdf' || content.formatVersion !== 2 || !object(content.cPages)) fail('requires a tablet-initialized format-2 PDF');
   if ((content.pages != null && (!Array.isArray(content.pages) || content.pages.length)) || (content.redirectionPageMap != null && (!Array.isArray(content.redirectionPageMap) || content.redirectionPageMap.length))) fail('conflicting legacy page map');
   const cp = content.cPages;
@@ -134,3 +136,34 @@ export async function prepareCPagesUpdate(archive: Uint8Array, newPdf: Uint8Arra
   if (pdf.length > LIMIT) fail('resulting PDF exceeds limit');
   return {pdf,content:strToU8(JSON.stringify(content)),deleteFiles:[...options.processedInkFiles].sort(),pages,oldPageCount,addedPageCount};
 }
+
+/** Initialized legacy maps have no CRDT clocks. Keep their logical IDs stable
+ * while appending backgrounds; never synthesize maps for an unvisited upload. */
+async function prepareLegacyUpdate(archive:Uint8Array,newPdf:Uint8Array,options:CPagesUpdateOptions,content:Record<string,any>,oldPdf:Uint8Array,documentId:string,names:Set<string>):Promise<PreparedCPagesUpdate> {
+  const ids = content.pages, redirects = content.redirectionPageMap;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 256 || !Array.isArray(redirects) || redirects.length !== ids.length || content.pageCount !== ids.length || ids.some(id=>typeof id !== 'string' || !UUID.test(id)) || new Set(ids).size !== ids.length)
+    fail('requires initialized legacy page IDs and redirections');
+  const original=await PDFDocument.load(oldPdf,{updateMetadata:false}), additional=await PDFDocument.load(newPdf,{updateMetadata:false});
+  const oldPageCount=original.getPageCount(), addedPageCount=additional.getPageCount();
+  if (!oldPageCount || !addedPageCount || oldPageCount+addedPageCount > 256 || content.originalPageCount !== oldPageCount || redirects.some(page=>!Number.isInteger(page) || page < -1 || page >= oldPageCount) || new Set(redirects.filter(page=>page>=0)).size !== redirects.filter(page=>page>=0).length)
+    fail('legacy physical PDF count or redirect mismatch');
+  const start=options.pageIds.length ? ids.indexOf(options.pageIds[0]) : ids.length;
+  if (start < 0 || options.pageIds.some((id,index)=>ids[start+index] !== id)) fail('selected legacy pages are not a contiguous ordered entry');
+  if (options.pageIds.some((_,index)=>redirects[start+index] < 0)) fail('selected native blank pages cannot be redirected');
+  if (ids.length-options.pageIds.length+addedPageCount > 256) fail('logical record limit');
+  const permittedInk=new Set(options.pageIds.map(id=>`${documentId}/${id}.rm`));
+  for (const file of options.processedInkFiles) if (typeof file !== 'string' || !permittedInk.has(file) || !names.has(file)) fail('processed ink is not an existing selected page member');
+  for (const file of permittedInk) if (names.has(file) && !options.processedInkFiles.includes(file)) fail('selected page has handwriting not explicitly marked processed');
+  const operationHash=sha(archive)+':'+sha(newPdf)+':'+options.pageIds.join(',');
+  const refreshedIds=Array.from({length:addedPageCount},(_,index)=>options.pageIds[index] ?? identity(`legacy-page:${documentId}:${operationHash}:${index}`));
+  if (refreshedIds.slice(options.pageIds.length).some(id=>ids.includes(id)) || new Set(refreshedIds).size !== refreshedIds.length) fail('new page UUID collision');
+  content.pages=[...ids.slice(0,start),...refreshedIds,...ids.slice(start+options.pageIds.length)];
+  content.redirectionPageMap=[...redirects.slice(0,start),...refreshedIds.map((_,index)=>oldPageCount+index),...redirects.slice(start+options.pageIds.length)];
+  content.pageCount=content.pages.length;content.originalPageCount=oldPageCount+addedPageCount;
+  for (const page of await original.copyPages(additional,additional.getPageIndices())) original.addPage(page);
+  const pdf=await original.save({addDefaultPage:false});if (pdf.length > LIMIT) fail('resulting PDF exceeds limit');
+  return {pdf,content:strToU8(JSON.stringify(content)),deleteFiles:[...options.processedInkFiles].sort(),pages:refreshedIds.map((pageId,index)=>({pageId,pdfPage:oldPageCount+index+1})),oldPageCount,addedPageCount};
+}
+
+/** Format-dispatching name for new callers; historical export remains compatible. */
+export const prepareNotebookUpdate = prepareCPagesUpdate;

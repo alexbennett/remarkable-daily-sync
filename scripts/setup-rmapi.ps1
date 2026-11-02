@@ -15,4 +15,3 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 } finally { Pop-Location }
 Write-Output "Built $outputPath from $revision. Source retained at $buildDirectory."
-

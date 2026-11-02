@@ -26,6 +26,10 @@ authorized document ID, full expected-file manifest CAS, strict cPages shape
 validation, and scoped processed-ink removal allowlist. Completed retries never
 remove reappearing ink. Unassigned native blank page records and ink remain
 unchanged; bounded alphabetic ordering keys support experimental middle growth.
+Initialized legacy page maps (formatVersion 1 or absent, preserved) support
+refresh/growth/shrink with unchanged
+unrelated IDs/maps and append-only physical PDF backgrounds. All changed or
+removed pages with ink require explicit processed-ink allowlisting.
 Added api/sync15/replacenotebook.go and tests,
 shell/replacenotebook.go and tests; shell/shell.go registers the command.
 This experimental writer is NOT yet validated on physical tablet hardware.
@@ -33,7 +37,7 @@ Dependency source archives and their embedded licenses: dependency-sources/.
 Build: Go 1.23.12 windows/amd64, CGO default, go build -trimpath
   -ldflags "-X github.com/juruen/rmapi/version.Version=aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373-append-v1-auth-v1-cache-v1-notebook-experimental-v1"
 Rebuild script: ../scripts/setup-rmapi.ps1
-Binary SHA256: 7319b981efb9f128107a5a4f8dc6c64f728eef4239ed209138a453d3963635e9
+Binary SHA256: 78e7a3f4a8a21dbba3dda313e0330d50cec9807426a2ad653ed15716f9d8dbad
 
 The helper is a separate command-line program. Guarded append was verified
 against a disposable cloud document: same ID, appended pages, unchanged other

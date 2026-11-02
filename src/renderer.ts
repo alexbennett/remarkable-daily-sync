@@ -294,6 +294,7 @@ export function archivePages(archive: Uint8Array, pageCount: number, originalPdf
   let entries: Array<{ id: string; page: number }>;
   const ignoredIds: string[] = [];
   const cPages = Array.isArray(content.cPages?.pages) && content.cPages.pages.length > 0;
+  let legacySubset = false;
   if (cPages) {
     const allIds = content.cPages.pages.map((item: any) => item?.id);
     if (new Set(allIds).size !== allIds.length || allIds.some((id: unknown) => typeof id !== 'string' || !/^[\w-]+$/.test(id)))
@@ -311,11 +312,20 @@ export function archivePages(archive: Uint8Array, pageCount: number, originalPdf
     }
   } else if (Array.isArray(content.pages) && content.pages.length) {
     entries = content.pages.map((id: string, index: number) => ({ id, page: content.redirectionPageMap?.[index] ?? index }));
+    // Updated initialized notebooks retain unused physical PDF backgrounds.
+    // Accept a subset only when both counts and the explicit map attest it.
+    legacySubset = content.originalPageCount === pageCount && content.pageCount === content.pages.length &&
+      Array.isArray(content.redirectionPageMap) && content.redirectionPageMap.length === content.pages.length;
+    if (legacySubset) {
+      if (new Set(content.pages).size !== content.pages.length || content.pages.some((id:unknown)=>typeof id !== 'string' || !/^[\w-]+$/.test(id))) throw new Error('Tablet page mapping has invalid or duplicate page IDs.');
+      ignoredIds.push(...entries.filter(entry=>entry.page === -1).map(entry=>entry.id));
+      entries = entries.filter(entry=>entry.page !== -1);
+    }
   } else if (!Object.keys(files).some(name => name.endsWith('.rm'))) {
     // A pristine uploaded PDF may have no page IDs until opened on the tablet.
     entries = Array.from({ length: pageCount }, (_, page) => ({ id: `pristine-${page}`, page }));
   } else throw new Error('Tablet page mapping is unavailable.');
-  if ((!cPages && entries.length !== pageCount) || new Set(entries.map(p => p.page)).size !== entries.length || new Set(entries.map(p => p.id)).size !== entries.length ||
+  if ((!cPages && !legacySubset && entries.length !== pageCount) || new Set(entries.map(p => p.page)).size !== entries.length || new Set(entries.map(p => p.id)).size !== entries.length ||
       entries.some(p => !Number.isInteger(p.page) || p.page < 0 || p.page >= pageCount || typeof p.id !== 'string' || !/^[\w-]+$/.test(p.id)))
     throw new Error('Tablet page mapping differs from the published PDF.');
   const used = new Set<string>();

@@ -304,6 +304,14 @@ test('cPages redirects select active physical backgrounds and retain ignored ink
   assert.throws(()=>archivePages(archive({fileType:'pdf',cPages:{pages:[{id:'same',redir:{value:0}},{id:'same',redir:{value:1}}]}}),2),/duplicate/);
 });
 
+test('legacy inactive physical backgrounds require explicit authoritative counts', () => {
+ const content={fileType:'pdf',formatVersion:1,pages:['active','blank'],redirectionPageMap:[3,-1],originalPageCount:4,pageCount:2};
+ assert.deepEqual(archivePages(archive(content,{'doc/blank.rm':new Uint8Array([1])}),4),[{id:'active',page:3,ink:undefined}]);
+ assert.throws(()=>archivePages(archive({...content,originalPageCount:undefined}),4),/mapping differs/);
+ assert.throws(()=>archivePages(archive({...content,pageCount:3}),4),/mapping differs/);
+ assert.throws(()=>archivePages(archive(content,{'doc/unknown.rm':new Uint8Array([1])}),4),/Unmapped/);
+});
+
 test('pristine PDFs and fully erased v6 pages remain identifiable', () => {
   assert.equal(archivePages(archive({ fileType: 'pdf' }), 2).length, 2);
   const header = strToU8('reMarkable .lines file, version=6          ');

@@ -80,3 +80,35 @@ test('native inserted blank bab and its ink survive middle growth between ba and
  base.cPages.pages[1].idx.value='baa';
  await assert.rejects(prepareCPagesUpdate(await archive(base),await pdf(2),{pageIds:[ids[0]],processedInkFiles:[ink]}),/ordering interval/);
 });
+
+test('initialized legacy refresh grows in the middle, shrinks, and preserves native blank IDs',async()=>{
+ const blank='eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+ const content={fileType:'pdf',formatVersion:1,pages:[ids[0],blank,ids[1]],redirectionPageMap:[0,-1,1],pageCount:3,originalPageCount:2,lastOpenedPage:2,extraMetadata:{keep:'yes'}};
+ const blankFile=`${doc}/${blank}.rm`;
+ const input=zipSync({[`${doc}.pdf`]:await pdf(2),[`${doc}.content`]:strToU8(JSON.stringify(content)),[ink]:new Uint8Array([1]),[blankFile]:new Uint8Array([2])});
+ const result=await prepareCPagesUpdate(input,await pdf(2),{pageIds:[ids[0]],processedInkFiles:[ink]});
+ const updated=JSON.parse(strFromU8(result.content));
+ assert.equal(updated.pages[0],ids[0]);assert.deepEqual(updated.pages.slice(2),[blank,ids[1]]);
+ assert.deepEqual(updated.redirectionPageMap,[2,3,-1,1]);assert.equal(updated.originalPageCount,4);assert.equal(updated.pageCount,4);
+ assert.equal(updated.lastOpenedPage,2);assert.deepEqual(updated.extraMetadata,content.extraMetadata);assert.deepEqual(result.deleteFiles,[ink]);
+ const nextArchive=zipSync({[`${doc}.pdf`]:result.pdf,[`${doc}.content`]:result.content,[blankFile]:new Uint8Array([2])});
+ const shrunk=await prepareCPagesUpdate(nextArchive,await pdf(1),{pageIds:result.pages.map(p=>p.pageId),processedInkFiles:[]});
+ const next=JSON.parse(strFromU8(shrunk.content));
+ assert.deepEqual(next.pages,[ids[0],blank,ids[1]]);assert.deepEqual(next.redirectionPageMap,[4,-1,1]);assert.equal(next.originalPageCount,5);
+ await assert.rejects(prepareCPagesUpdate(input,await pdf(1),{pageIds:[blank],processedInkFiles:[blankFile]}),/native blank/);
+ const pristine={...content,pages:null,redirectionPageMap:null,pageCount:0};
+ await assert.rejects(prepareCPagesUpdate(await archive(pristine),await pdf(1),{pageIds:[],processedInkFiles:[]}),/initialized legacy/);
+ const noCount={...content,originalPageCount:undefined};
+ await assert.rejects(prepareCPagesUpdate(await archive(noCount),await pdf(1),{pageIds:[],processedInkFiles:[]}),/count or redirect/);
+});
+
+test('initialized legacy maps allow absent formatVersion without inventing one',async()=>{
+ const content={fileType:'pdf',pages:ids,redirectionPageMap:[0,1],pageCount:2,originalPageCount:2};
+ const input=await archive(content);
+ const result=await prepareCPagesUpdate(input,await pdf(1),{pageIds:[ids[1]],processedInkFiles:[]});
+ const updated=JSON.parse(strFromU8(result.content));
+ assert.equal(Object.hasOwn(updated,'formatVersion'),false);
+ assert.deepEqual(updated.redirectionPageMap,[0,2]);
+ for(const formatVersion of [null,0,3]) await assert.rejects(prepareCPagesUpdate(await archive({...content,formatVersion}),await pdf(1),{pageIds:[],processedInkFiles:[]}),/refused/);
+ await assert.rejects(prepareCPagesUpdate(await archive({...content,pages:null,redirectionPageMap:null,pageCount:0}),await pdf(1),{pageIds:[],processedInkFiles:[]}),/initialized legacy/);
+});

@@ -18,6 +18,7 @@ interface Journal {
   kind: 'create' | 'update'; notebookId: string; generation: number; documentId?: string;
   uploadName?: string; pdfFile: string; expectedFile?: string; contentFile?: string;
   deleteFiles?: string[]; entries: EntryCommit[];
+  format?: string;
 }
 class NotebookDeferred extends Error {}
 
@@ -50,7 +51,13 @@ async function snapshot(bytes: Uint8Array): Promise<Snapshot> {
   } else {
     format = 'legacy';
     if (!Array.isArray(content.pages) || !Array.isArray(content.redirectionPageMap) || content.pages.length !== content.redirectionPageMap.length) throw new NotebookDeferred('Open the uploaded notebook on the tablet and let it sync before publishing updates.');
-    pages = content.pages.map((pageId: string, i: number) => ({ pageId, pdfPage: content.redirectionPageMap[i] + 1 }));
+    if (new Set(content.pages).size !== content.pages.length || content.pages.some((id: unknown) => typeof id !== 'string' || !id)) throw new NotebookDeferred('Notebook page identities are invalid.');
+    pages = content.pages.flatMap((pageId: string, i: number) => {
+      const redirect = content.redirectionPageMap[i];
+      if (redirect === -1) { unassignedPageIds.push(pageId); return []; }
+      if (!Number.isInteger(redirect) || redirect < 0) throw new NotebookDeferred('Notebook PDF page redirection is invalid.');
+      return [{ pageId, pdfPage: redirect + 1 }];
+    });
   }
   if (!pages.length || pages.some(p => typeof p.pageId !== 'string' || !p.pageId || !Number.isInteger(p.pdfPage) || p.pdfPage < 1 || p.pdfPage > count) || new Set(pages.map(p => p.pageId)).size !== pages.length || new Set(pages.map(p => p.pdfPage)).size !== pages.length) throw new NotebookDeferred('Notebook page mapping requires review before publishing.');
   return { pdf, pages, format, unassignedPageIds, inkFiles: names.filter(n => n.endsWith('.rm')) };
@@ -118,7 +125,6 @@ export class NotebookSync {
   }
 
   private async update(notebook: NotebookState): Promise<void> {
-    if (!this.callbacks.authorize(notebook.documentId, 'cPages-v2')) throw new NotebookDeferred('Notebook updates are awaiting validation for this tablet document and format.');
     if (!this.transport.replaceNotebook) throw new NotebookDeferred('The installed cloud helper does not support notebook updates.');
     const active = this.active(notebook);
     // All affected handwriting must reach durable notes before any ink is removed.
@@ -129,9 +135,9 @@ export class NotebookSync {
     const downloaded = await this.transport.download(notebook.documentId!);
     if (active.some(a => a.revision.fingerprint !== downloaded.fingerprint && !this.state.reviews.some(r => r.revisionId === a.revision.id && r.fingerprint === downloaded.fingerprint))) throw new NotebookDeferred('Notebook changed during handwriting import; it will be retried on the next sync.');
     const before = await snapshot(downloaded.bytes);
+    if (!this.callbacks.authorize(notebook.documentId, before.format)) throw new NotebookDeferred('Notebook updates are awaiting validation for this tablet document and format.');
     if (before.pages.length !== notebook.pages.length || before.pages.some(p => !notebook.pages.some(known => known.pageId === p.pageId && known.pdfPage === p.pdfPage))) throw new NotebookDeferred('Tablet notebook page mapping changed; preserve the original and review its new pages before publishing.');
     if (!changed) { notebook.pendingReason = reviewNotes.size ? 'Resolve pending notebook entry reviews before publishing those entries.' : unassignedNotice(before); await this.save(); if (notebook.pendingReason) this.host.status(notebook.pendingReason); return; }
-    if (before.format !== 'cPages-v2') throw new NotebookDeferred('Open this notebook on the tablet and sync its cPages metadata before updating it.');
     const prior = active.find(a => a.note.id === changed.id)?.revision;
     const ids = prior?.pageIds ?? [];
     const inkFiles = before.inkFiles.filter(file => ids.some(id => file.endsWith(`/${id}.rm`)));
@@ -145,7 +151,7 @@ export class NotebookSync {
       firstPage: prepared.pages[0].pdfPage, lastPage: prepared.pages.at(-1)!.pdfPage, pageIds: prepared.pages.map(p => p.pageId),
       pdfFile, archived: false, createdAt: new Date().toISOString() };
     const journal: Journal = { kind: 'update', notebookId: notebook.id, generation: notebook.generation + 1, documentId: notebook.documentId,
-      pdfFile, expectedFile: await this.store.write(`notebooks/${notebook.id}/${operation}.before.rmdoc`, downloaded.bytes),
+      pdfFile, format: before.format, expectedFile: await this.store.write(`notebooks/${notebook.id}/${operation}.before.rmdoc`, downloaded.bytes),
       contentFile: await this.store.write(`notebooks/${notebook.id}/${operation}.content`, prepared.content), deleteFiles: prepared.deleteFiles,
       entries: [{ noteId: changed.id, revision }] };
     await this.store.write('pending-notebook.json', JSON.stringify(journal)); await this.recover();
@@ -159,7 +165,8 @@ export class NotebookSync {
     if (!this.settings().notebookMappings?.some(mapping => mapping.id === notebook.mappingId && mapping.enabled)) {
       await this.pending(notebook, 'Pending notebook operation is paused because its folder mapping is disabled or removed.'); return;
     }
-    if (!this.callbacks.authorize(journal.documentId, journal.kind === 'create' ? 'create' : 'cPages-v2')) {
+    const operationFormat = journal.kind === 'create' ? 'create' : journal.format ?? (await snapshot(await this.store.read(journal.expectedFile!))).format;
+    if (!this.callbacks.authorize(journal.documentId, operationFormat)) {
       await this.pending(notebook, 'A pending notebook operation is waiting for scoped tablet validation.'); return;
     }
     const pdf = await this.store.read(journal.pdfFile);
@@ -213,16 +220,18 @@ export class NotebookSync {
 
   private async finishLegacyArchive(notebook: NotebookState): Promise<void> {
     if (!notebook.documentId || !notebook.generation) return;
+    if (!this.settings().notebookMappings?.some(mapping => mapping.id === notebook.mappingId && mapping.enabled)) return;
     const ids = new Set<string>();
     for (const noteId of notebook.entryIds) for (const revision of this.state.notes[noteId]?.revisions ?? []) {
       if (!revision.notebookId && !revision.archived && (revision.documentId ?? revision.id) !== notebook.documentId) ids.add(revision.documentId ?? revision.id);
     }
     for (const id of ids) {
+      if (!this.settings().notebookMappings?.some(mapping => mapping.id === notebook.mappingId && mapping.enabled)) return;
       this.assertActive(); await this.transport.archive(id);
       for (const note of Object.values(this.state.notes)) for (const rev of note.revisions) if (!rev.notebookId && (rev.documentId ?? rev.id) === id) rev.archived = true;
       await this.save();
     }
-    const title = this.settings().notebookMappings?.find(m => m.id === notebook.mappingId)?.title;
+    const title = this.settings().notebookMappings?.find(m => m.id === notebook.mappingId && m.enabled)?.title;
     if (title && this.transport.rename) await this.transport.rename(notebook.documentId, title);
   }
 }

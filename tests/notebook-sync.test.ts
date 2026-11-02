@@ -10,7 +10,8 @@ import { LocalStore, hash } from '../src/storage';
 import { NotebookSync } from '../src/notebook-sync';
 import { NoteRenderer } from '../src/renderer';
 import { mergeThreeWay } from '../src/merge';
-import type { CloudDocument, NoteState, Revision, Settings, Transport } from '../src/contracts';
+import { SyncEngine, type VaultHost } from '../src/engine';
+import type { CloudDocument, NoteState, Revision, Settings, Transport, Renderer, Recognizer, PageImage } from '../src/contracts';
 
 async function setup(t: TestContext) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'remarkable-notebook-sync-'));
@@ -26,7 +27,9 @@ async function setup(t: TestContext) {
   const remoteId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', pdfKey = `${remoteId}.pdf`, contentKey = `${remoteId}.content`;
   const archived: string[] = [], events: string[] = [], statuses: string[] = [];
   let archive: Uint8Array | undefined, doc: CloudDocument | undefined, uploads = 0, writes = 0, writeCalls = 0;
-  let authorized = true, initialized = true, failUnknown = false, conflict = false;
+  let authorized = true, initialized = true, initialLegacy = false, failUnknown = false, conflict = false;
+  let requireCallbackEvents = true;
+  const authorizedFormats: string[] = [];
   const transport: Transport = {
     check: async () => 'ok', list: async () => doc ? [doc] : [],
     upload: async (name, pdf) => {
@@ -37,6 +40,11 @@ async function setup(t: TestContext) {
         original: { timestamp: '1:1', value: count }, uuids: [{ first: randomUUID(), second: 1 }],
         pages: Array.from({ length: count }, (_, i) => ({ id: randomUUID(), idx: { timestamp: '1:2', value: `b${String.fromCharCode(97 + i)}` }, redir: { timestamp: '1:2', value: i }, template: { timestamp: '1:2', value: 'Blank' } }))
       } } : { fileType: 'pdf', pages: null, redirectionPageMap: null, pageCount: 0 };
+      if (initialLegacy && initialized) {
+        const legacy = content as any; legacy.formatVersion = 1; legacy.originalPageCount = count;
+        legacy.pages = legacy.cPages.pages.map((page: any) => page.id);
+        legacy.redirectionPageMap = legacy.cPages.pages.map((page: any) => page.redir.value); delete legacy.cPages;
+      }
       archive = zipSync({ [pdfKey]: pdf, [contentKey]: strToU8(JSON.stringify(content)), [`${remoteId}.metadata`]: strToU8('preserved metadata') });
       doc = { id: remoteId, name, parent: 'Notes', version: 1, modifiedClient: '' }; return doc;
     },
@@ -47,7 +55,7 @@ async function setup(t: TestContext) {
       const entries = unzipSync(archive);
       if (hash(entries[pdfKey]) === hash(pdf) && hash(entries[contentKey]) === hash(content)) return;
       if (conflict || hash(archive) !== hash(expected)) { const error = new Error('remote changed'); error.name = 'NotebookUpdateConflictError'; throw error; }
-      assert.ok(events.includes('pull:a') && events.includes('pull:b'), 'all active entries must import first');
+      if (requireCallbackEvents) assert.ok(events.includes('pull:a') && events.includes('pull:b'), 'all active entries must import first');
       entries[pdfKey] = new Uint8Array(pdf); entries[contentKey] = new Uint8Array(content);
       for (const file of removed) delete entries[file];
       archive = zipSync(entries); writes++; events.push('replace');
@@ -65,7 +73,7 @@ async function setup(t: TestContext) {
     assert.deepEqual(merged.conflicts, []); files.set(note.path, merged.text);
     revision.tabletText = interpreted; revision.fingerprint = hash(archive); await store.save(state);
   };
-  const callbacks = { pull, authorize: (_id: string | undefined, _format: string) => authorized };
+  const callbacks = { pull, authorize: (_id: string | undefined, format: string) => { authorizedFormats.push(format); return authorized; } };
   const host = { read: async (p: string) => files.get(p) ?? null, status: (message: string) => { statuses.push(message); } };
   const controller = new NotebookSync(state, () => settings, host, store, transport, new NoteRenderer(), callbacks);
   const ink = (noteId: string, before: string, after: string) => {
@@ -82,9 +90,9 @@ async function setup(t: TestContext) {
     const entries = unzipSync(archive!), key = `${remoteId}/${id}.rm`, bytes = strToU8('unassigned handwritten blank'); entries[key] = bytes; archive = zipSync(entries);
     return { record, key, bytes };
   };
-  return { controller, state, store, files, settings, callbacks, transport, host, archived, events, statuses, ink, remoteId, pdfKey, contentKey, addBlank, editContent,
+  return { controller, state, store, files, settings, callbacks, transport, host, archived, events, statuses, ink, remoteId, pdfKey, contentKey, addBlank, editContent, authorizedFormats,
     entries: () => { assert.ok(archive); return unzipSync(archive); }, stats: () => ({ uploads, writes, writeCalls }),
-    authorize: (value: boolean) => { authorized = value; }, uninitialized: () => { initialized = false; }, unknown: () => { failUnknown = true; }, conflict: () => { conflict = true; } };
+    authorize: (value: boolean) => { authorized = value; }, fullEngine: () => { requireCallbackEvents = false; }, uninitialized: () => { initialized = false; }, legacy: () => { initialLegacy = true; }, unknown: () => { failUnknown = true; }, conflict: () => { conflict = true; } };
 }
 
 test('initial combined notebook publishes once, captures tablet IDs, and archives old documents only after verification', async t => {
@@ -132,14 +140,27 @@ test('unknown PDF-backed pages never gain an inferred source-note assignment', a
   assert.match(s.state.notebooks.book.pendingReason!, /mapping.*review/);
 });
 
-test('legacy initialization defers changes until the tablet supplies cPages identities', async t => {
-  const s = await setup(t); await s.controller.sync();
-  const prior = JSON.parse(strFromU8(s.entries()[s.contentKey]));
-  s.editContent(content => { content.formatVersion = 1; content.pages = content.cPages.pages.map((p: any) => p.id); content.redirectionPageMap = content.cPages.pages.map((p: any) => p.redir.value); delete content.cPages; });
+test('initialized legacy notebook updates the same document without inserting a native blank', async t => {
+  const s = await setup(t); s.legacy(); await s.controller.sync();
+  const oldIds = s.state.notebooks.book.pages.map(p => p.pageId);
   s.files.set('Notes/A.md', 'updated alpha'); await s.controller.sync();
-  assert.equal(s.stats().writes, 0); assert.match(s.state.notebooks.book.pendingReason!, /Open.*cPages/);
-  s.editContent(content => { content.formatVersion = 2; content.cPages = prior.cPages; delete content.pages; delete content.redirectionPageMap; });
-  await s.controller.sync(); assert.equal(s.stats().writes, 1); assert.equal(s.state.notebooks.book.generation, 2);
+  assert.equal(s.stats().writes, 1); assert.equal(s.state.notebooks.book.generation, 2);
+  assert.equal(s.state.notebooks.book.documentId, s.remoteId); assert.equal(s.state.notebooks.book.format, 'legacy');
+  assert.deepEqual(s.state.notebooks.book.pages.map(p => p.pageId), oldIds);
+  assert.ok(s.authorizedFormats.includes('legacy')); assert.equal(s.authorizedFormats.includes('cPages-v2'), false);
+  const content = JSON.parse(strFromU8(s.entries()[s.contentKey])); assert.equal(content.cPages, undefined);
+  assert.equal(s.state.notes.a.revisions.at(-1)!.firstPage, 3);
+});
+
+test('legacy recovery uses the captured format and remains idempotent after unknown success', async t => {
+  const s = await setup(t); s.legacy(); await s.controller.sync(); s.files.set('Notes/A.md', 'changed'); s.unknown();
+  await assert.rejects(s.controller.sync(), /unknown response/);
+  const pending = JSON.parse((await s.store.readText('pending-notebook.json'))!); assert.equal(pending.format, 'legacy');
+  // Old journals have no explicit format; the original archive remains authoritative.
+  delete pending.format; await s.store.write('pending-notebook.json', JSON.stringify(pending));
+  await s.controller.recover();
+  assert.equal(s.authorizedFormats.at(-1), 'legacy'); assert.equal(s.stats().writes, 1);
+  assert.equal(await s.store.readText('pending-notebook.json'), null);
 });
 
 test('entry refresh preserves stable document and other entry ink after all handwriting is imported', async t => {
@@ -220,4 +241,141 @@ test('review or CAS conflict prevents publication without acknowledging source t
   assert.equal(s.state.notebooks.book.generation, 1); assert.equal(s.state.notes.a.revisions.length, 1);
   assert.equal(await s.store.readText('pending-notebook.json'), null);
   assert.match(s.state.notebooks.book.pendingReason!, /Tablet changed/);
+});
+
+test('a review blocks only its entry while another entry refreshes without discarding that ink', async t => {
+  const s = await setup(t); await s.controller.sync(); const ink = s.ink('b', 'beta', 'uncertain beta');
+  s.state.reviews.push({ id: 'review-b', noteId: 'b', revisionId: s.state.notes.b.revisions[0].id, fingerprint: '', createdAt: '', base: 'beta', current: 'beta', proposed: 'uncertain beta', tabletText: 'uncertain beta', reasons: ['uncertain'], kinds: [], images: [] });
+  s.files.set('Notes/A.md', 'updated alpha'); await s.controller.sync();
+  assert.equal(s.stats().writes, 1); assert.ok(s.entries()[ink]);
+  assert.equal(s.state.notes.b.revisions.length, 1); assert.equal(s.state.reviews[0].id, 'review-b');
+  assert.equal(s.state.notes.a.revisions.at(-1)!.baseline, 'updated alpha');
+});
+
+test('disabled or removed mappings retain recovery journals without retrying a pending mutation', async t => {
+  const s = await setup(t); await s.controller.sync(); s.files.set('Notes/A.md', 'changed'); s.unknown();
+  await assert.rejects(s.controller.sync(), /unknown response/);
+  const original = await s.store.readText('pending-notebook.json');
+  s.settings.notebookMappings![0].enabled = false; await s.controller.recover();
+  assert.equal(s.stats().writeCalls, 1); assert.equal(await s.store.readText('pending-notebook.json'), original);
+  s.settings.notebookMappings = []; await s.controller.recover(); assert.equal(s.stats().writeCalls, 1);
+  s.settings.notebookMappings = [{ id: 'mapping', folder: 'Notes', title: 'Project Notes', enabled: true }];
+  await s.controller.recover(); assert.equal(await s.store.readText('pending-notebook.json'), null);
+  assert.equal(s.stats().writes, 1);
+});
+
+test('initial creation refuses a conflicting cloud title before upload', async t => {
+  const s = await setup(t);
+  s.transport.list = async () => [{ id: 'existing', name: 'Project Notes', parent: 'Notes', version: 1, modifiedClient: '' }];
+  await s.controller.sync();
+  assert.equal(s.stats().uploads, 0); assert.equal(s.state.notebooks.book.generation, 0);
+  assert.equal(await s.store.readText('pending-notebook.json'), null);
+  assert.match(s.state.notebooks.book.pendingReason!, /already exists/);
+});
+
+test('mapping paused during upload verification cannot archive its old individual documents', async t => {
+  const s = await setup(t);
+  s.state.notes.a.revisions.push({ id: 'legacy', baseline: 'older', tabletText: 'older', name: 'legacy', blocks: [], pdfFile: 'old.pdf', archived: false, createdAt: '' });
+  const download = s.transport.download; let paused = false;
+  s.transport.download = async id => {
+    const result = await download(id);
+    if (!paused) { paused = true; s.settings.notebookMappings![0].enabled = false; }
+    return result;
+  };
+  await s.controller.sync();
+  assert.equal(s.state.notebooks.book.generation, 1); assert.equal(s.state.notes.a.revisions[0].archived, false);
+  assert.deepEqual(s.archived, []);
+  s.settings.notebookMappings![0].enabled = true; await s.controller.sync();
+  assert.deepEqual(s.archived, ['legacy']); assert.equal(s.stats().uploads, 1);
+});
+
+test('full SyncEngine roundtrip routes handwritten edits by stable IDs after physical notebook refresh', async t => {
+  const s = await setup(t); s.fullEngine(); s.legacy();
+  const host: VaultHost = { ...s.host, files: () => [...s.files.keys()], readSaved: async p => s.files.get(p) ?? null,
+    compareAndWrite: async (p, expected, next) => { assert.equal(s.files.get(p), expected); s.files.set(p, next); } };
+  const real = new NoteRenderer();
+  const renderer: Renderer = {
+    render: (text, title) => real.render(text, title),
+    images: async (archive, originalPdf) => {
+      const entries = unzipSync(archive), content = JSON.parse(strFromU8(entries[s.contentKey]));
+      assert.equal((await PDFDocument.load(entries[s.pdfKey])).getPageCount(), (await PDFDocument.load(originalPdf)).getPageCount());
+      return content.pages.flatMap((id: string, index: number): PageImage[] => {
+        const redirect = content.redirectionPageMap[index]; if (redirect < 0) return [];
+        const ink = entries[`${s.remoteId}/${id}.rm`], base = Buffer.from(`printed:${id}:${redirect}`).toString('base64');
+        const annotated = ink ? Buffer.from(ink).toString('base64') : base;
+        return [{ page: redirect + 1, pageId: id, base, annotated, inkHash: hash(annotated) }];
+      });
+    }
+  };
+  const seen: Array<{ page: number; blockPage: number; source: string }> = [];
+  const recognizer: Recognizer = { check: async () => 'ok', interpret: async (pages, blocks) => ({ warnings: [], edits: pages.map(page => {
+    const change = JSON.parse(Buffer.from(page.annotated, 'base64').toString());
+    const block = blocks.find(b => b.page === page.page && b.markdown.includes(change.before)); assert.ok(block);
+    seen.push({ page: page.page, blockPage: block.page, source: block.markdown });
+    return { blockId: block.id, page: page.page, before: change.before, after: change.after, kind: 'replace', ambiguous: false, reason: 'clear' };
+  }) }) };
+  const engine = new SyncEngine(s.state, () => s.settings, host, s.store, s.transport, renderer, recognizer, () => true);
+  await engine.tick();
+  const first = s.state.notes.a.revisions[0];
+  s.ink('a', 'alpha', 'handwritten'); await engine.tick();
+  assert.equal(s.files.get('Notes/A.md'), 'handwritten\n\noriginal');
+  assert.equal(s.files.get('Notes/B.md'), 'beta'); assert.equal(s.state.reviews.length, 0);
+  assert.equal(s.stats().writes, 1); assert.equal(first.superseded, true);
+  const refreshed = s.state.notes.a.revisions.at(-1)!;
+  assert.deepEqual(refreshed.pageIds, first.pageIds); assert.ok(refreshed.firstPage! > first.lastPage!);
+  s.ink('a', 'handwritten', 'second edit'); await engine.tick();
+  assert.equal(s.files.get('Notes/A.md'), 'second edit\n\noriginal'); assert.equal(s.stats().writes, 2);
+  assert.deepEqual(seen.map(item => item.page), [1, 3]);
+  assert.ok(seen.every(item => item.page === item.blockPage));
+  await engine.tick(); assert.equal(s.stats().writes, 2); assert.equal(seen.length, 2);
+  assert.equal(s.stats().uploads, 1); assert.equal(await s.store.readText('pending-notebook.json'), null);
+});
+
+test('removing a daily mapping publishes individual notes without archiving or renaming the shared notebook', async t => {
+  const s = await setup(t); s.fullEngine(); s.legacy();
+  const folder = 'Daily/(11) November 2026', aPath = `${folder}/November 1, 2026.md`, bPath = `${folder}/November 2, 2026.md`;
+  s.files.clear(); s.files.set(aPath, 'alpha\n\noriginal'); s.files.set(bPath, 'beta');
+  s.state.notes.a.path = aPath; s.state.notes.a.date = '2026-11-01';
+  s.state.notes.b.path = bPath; s.state.notes.b.date = '2026-11-02';
+  s.settings.notebookMappings![0].folder = folder;
+  await s.controller.sync();
+  const originals = [s.state.notes.a.revisions[0], s.state.notes.b.revisions[0]];
+  const individual = new Map<string, { doc: CloudDocument; bytes: Uint8Array }>();
+  const originalList = s.transport.list, originalDownload = s.transport.download;
+  const renamed: string[] = [];
+  s.transport.list = async () => [...await originalList(), ...[...individual.values()].map(entry => entry.doc)];
+  s.transport.download = async id => { const entry = individual.get(id); return entry ? { bytes: entry.bytes, fingerprint: hash(entry.bytes) } : originalDownload(id); };
+  s.transport.upload = async (name, pdf) => {
+    const id = `individual-${individual.size + 1}`, count = (await PDFDocument.load(pdf)).getPageCount();
+    const doc = { id, name, parent: 'Notes', version: 1, modifiedClient: '' };
+    const content = { fileType: 'pdf', formatVersion: 1, pages: Array.from({ length: count }, () => randomUUID()), redirectionPageMap: Array.from({ length: count }, (_, i) => i), originalPageCount: count, pageCount: count };
+    individual.set(id, { doc, bytes: zipSync({ [`${id}.pdf`]: pdf, [`${id}.content`]: strToU8(JSON.stringify(content)) }) }); return doc;
+  };
+  s.transport.rename = async (id, name) => { renamed.push(id); assert.notEqual(id, s.remoteId, 'shared notebook must never be renamed by per-note publication'); const entry = individual.get(id)!; entry.doc.name = name; return entry.doc; };
+  const host: VaultHost = { ...s.host, files: () => [...s.files.keys()], readSaved: async p => s.files.get(p) ?? null,
+    compareAndWrite: async (p, expected, next) => { assert.equal(s.files.get(p), expected); s.files.set(p, next); } };
+  const real = new NoteRenderer();
+  const renderer: Renderer = { render: (text, title) => real.render(text, title), images: async archive => {
+    const entries = unzipSync(archive), contentKey = Object.keys(entries).find(key => key.endsWith('.content'))!;
+    const content = JSON.parse(strFromU8(entries[contentKey])), id = contentKey.slice(0, -8);
+    return content.pages.map((pageId: string, index: number) => {
+      const ink = entries[`${id}/${pageId}.rm`], base = Buffer.from(`printed:${pageId}`).toString('base64');
+      const annotated = ink ? Buffer.from(ink).toString('base64') : base;
+      return { page: content.redirectionPageMap[index] + 1, pageId, base, annotated, inkHash: hash(annotated) };
+    });
+  } };
+  const recognizer: Recognizer = { check: async () => 'ok', interpret: async (pages, blocks) => ({ warnings: [], edits: pages.map(page => {
+    const edit = JSON.parse(Buffer.from(page.annotated, 'base64').toString()), block = blocks.find(b => b.page === page.page && b.markdown.includes(edit.before)); assert.ok(block);
+    return { blockId: block.id, page: page.page, before: edit.before, after: edit.after, kind: 'replace', ambiguous: false, reason: 'clear' };
+  }) }) };
+  s.settings.notebookMappings = [];
+  const engine = new SyncEngine(s.state, () => s.settings, host, s.store, s.transport, renderer, recognizer, () => true);
+  await engine.tick();
+  assert.equal(individual.size, 2); assert.equal(s.archived.includes(s.remoteId), false); assert.equal(renamed.includes(s.remoteId), false);
+  assert.ok(originals.every(revision => !revision.archived && !revision.superseded));
+  assert.ok([s.state.notes.a, s.state.notes.b].every(note => !note.revisions.at(-1)!.notebookId));
+  s.ink('a', 'alpha', 'late tablet handwriting'); await engine.tick();
+  assert.equal(s.files.get(aPath), 'late tablet handwriting\n\noriginal'); assert.equal(s.files.get(bPath), 'beta');
+  assert.equal(s.state.reviews.length, 0); assert.equal(s.archived.includes(s.remoteId), false); assert.equal(renamed.includes(s.remoteId), false);
+  const count = individual.size; await engine.tick(); assert.equal(individual.size, count);
 });
