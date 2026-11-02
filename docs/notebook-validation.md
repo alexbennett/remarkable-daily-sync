@@ -23,7 +23,11 @@ Further physical checks:
 - A separate fresh upload of the **exact same six-page PDF bytes** displayed all pages with text. This isolates the failure to the existing-document update path rather than the PDF's basic rendering compatibility.
 - Renaming the original document through the normal cloud operation refreshed its document metadata. All non-metadata archive members stayed byte-identical. The tablet still showed the 5.0x problem, including blank printed pages 2 and 5; page 3 was the intentionally blank page.
 
-The next diagnostic is a read-only USB export of the original disposable document. Compare its actual tablet PDF bytes with the original and updated cloud PDFs. A cloud read-back alone cannot distinguish a stale local PDF from a local rendering-cache or page-metadata problem. No production compatibility evidence has been issued.
+USB export was unavailable, so a further isolated cloud test used the working six-page control after the tablet initialized it as format 1. Refreshing its first page under the same document ID produced seven physical PDF backgrounds with six logical pages and redirections `[6,1,2,3,4,5]`. The user confirmed all pages displayed correctly. This shows that the PDF update path can work with initialized legacy metadata; the failure is associated with the tested format-2 update, rather than a universal inability to replace PDFs.
+
+The user also confirmed that the existing Alpha page in the format-2 notebook was blank/unreadable. Thus the failure affects refreshed existing page IDs as well as newly added IDs. It must not be diagnosed as a new-page-only initialization issue.
+
+A read-only USB export could still distinguish a stale local PDF from a local rendering-cache or page-metadata problem in the format-2 notebook. Cloud read-back alone cannot do that. No production compatibility evidence has been issued.
 
 ## Remaining acceptance checks
 
