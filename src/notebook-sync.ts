@@ -82,6 +82,52 @@ export class NotebookSync {
       lastPage: entry.lastPage, pdfFile, archived: false, createdAt: new Date().toISOString() };
   }
 
+  /** Detect a replaced published layout before OCR. This does not detect whether
+   * the tablet currently has a notebook open, or prevent a later device write. */
+  async preflight(notebookId?: string): Promise<Set<string>> {
+    const blocked = new Set<string>();
+    const raw = await this.store.readText('pending-notebook.json');
+    const journal = raw ? JSON.parse(raw) as Journal : undefined;
+    for (const notebook of Object.values(this.state.notebooks)) {
+      if ((notebookId && notebook.id !== notebookId) || !notebook.documentId || !notebook.generation) continue;
+      const downloaded = await this.transport.download(notebook.documentId);
+      let current: Snapshot | undefined;
+      try { current = await snapshot(downloaded.bytes); } catch { /* Preserve invalid layouts below. */ }
+      const matches = async (pdfFile: string | undefined, pages: Array<{pageId: string; pdfPage: number}>) => {
+        if (!current || !pdfFile || !pages.length || current.pages.length !== pages.length) return false;
+        if (new Set(pages.map(p => p.pageId)).size !== pages.length || new Set(pages.map(p => p.pdfPage)).size !== pages.length) return false;
+        return hash(current.pdf) === hash(await this.store.read(pdfFile)) && current.pages.every(p => pages.some(expected => expected.pageId === p.pageId && expected.pdfPage === p.pdfPage));
+      };
+      let recognized = await matches(notebook.pdfFile, notebook.pages);
+      if (!recognized && journal?.kind === 'update' && journal.notebookId === notebook.id && journal.documentId === notebook.documentId) {
+        const changed = new Set(journal.entries.map(entry => entry.noteId));
+        const target = notebook.pages.filter(page => !changed.has(page.noteId)).map(page => ({ pageId: page.pageId, pdfPage: page.pdfPage }));
+        let complete = true;
+        for (const { revision } of journal.entries) {
+          if (!revision.pageIds?.length || !Number.isInteger(revision.firstPage) || revision.firstPage! < 1 || revision.lastPage !== revision.firstPage! + revision.pageIds.length - 1) { complete = false; break; }
+          revision.pageIds.forEach((pageId, index) => target.push({ pageId, pdfPage: revision.firstPage! + index }));
+        }
+        if (complete) recognized = await matches(journal.pdfFile, target);
+      }
+      if (recognized) {
+        if (notebook.layoutConflict) {
+          if (notebook.pendingReason === notebook.layoutConflict.reason) notebook.pendingReason = unassignedNotice(current!);
+          delete notebook.layoutConflict; await this.save();
+        }
+        continue;
+      }
+      blocked.add(notebook.id);
+      const fingerprint = downloaded.fingerprint;
+      const reason = 'Tablet notebook layout no longer matches the published layout. Close the notebook and sync; the preserved tablet copy needs reconciliation before synchronization resumes. Saved Obsidian notes are unchanged.';
+      if (notebook.layoutConflict?.fingerprint !== fingerprint) {
+        const archiveFile = await this.store.write(`notebooks/${notebook.id}/layout-conflicts/${fingerprint}.rmdoc`, downloaded.bytes);
+        notebook.layoutConflict = { fingerprint, archiveFile, reason };
+      }
+      notebook.pendingReason = reason; await this.save(); this.host.status(reason);
+    }
+    return blocked;
+  }
+
   async sync(): Promise<void> {
     await this.recover();
     if (await this.store.readText('pending-notebook.json')) return;
@@ -125,6 +171,7 @@ export class NotebookSync {
   }
 
   private async update(notebook: NotebookState): Promise<void> {
+    if ((await this.preflight(notebook.id)).has(notebook.id)) return;
     if (!this.transport.replaceNotebook) throw new NotebookDeferred('The installed cloud helper does not support notebook updates.');
     const active = this.active(notebook);
     // All affected handwriting must reach durable notes before any ink is removed.
@@ -162,6 +209,7 @@ export class NotebookSync {
     const journal = JSON.parse(raw) as Journal, notebook = this.state.notebooks[journal.notebookId];
     if (!notebook) throw new Error('Pending notebook operation refers to an unknown notebook.');
     this.assertActive();
+    if ((await this.preflight(notebook.id)).has(notebook.id)) return;
     if (!this.settings().notebookMappings?.some(mapping => mapping.id === notebook.mappingId && mapping.enabled)) {
       await this.pending(notebook, 'Pending notebook operation is paused because its folder mapping is disabled or removed.'); return;
     }
@@ -220,6 +268,7 @@ export class NotebookSync {
 
   private async finishLegacyArchive(notebook: NotebookState): Promise<void> {
     if (!notebook.documentId || !notebook.generation) return;
+    if (notebook.layoutConflict) return;
     if (!this.settings().notebookMappings?.some(mapping => mapping.id === notebook.mappingId && mapping.enabled)) return;
     const ids = new Set<string>();
     for (const noteId of notebook.entryIds) for (const revision of this.state.notes[noteId]?.revisions ?? []) {

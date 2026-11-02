@@ -43,6 +43,8 @@ Persistent tablet notebook publishing is **not enabled**: safe in-place updates 
 
 Preview creates no tablet documents, archives nothing, and does not acknowledge notes as published. State upgrades keep an exact v1 backup in the private `backups` folder. Local previews and their source manifests live in `notebook-previews`. Do not manually change validation fields to attempt activation; they cannot bypass the transport gate.
 
+During disposable notebook validation, close the notebook on the tablet and let it sync **before** uploading a layout update. Reopen it after the upload finishes. The cloud API does not expose whether a document is open or lock it against a later tablet save. If a published PDF or page mapping changes unexpectedly, the plugin preserves the tablet archive in `notebooks/<id>/layout-conflicts` and pauses that notebook's imports and updates. Saved Obsidian text and pending update files remain available; the conflicting layout is not automatically overwritten. Physical test results are recorded in [notebook validation](docs/notebook-validation.md).
+
 ### Current sync limits
 
 - Same-document page appending is supported only for legacy PDF metadata. Newer `cPages` documents require the new-PDF workflow above.

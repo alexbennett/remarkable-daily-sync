@@ -122,11 +122,13 @@ export class SyncEngine {
       this.host.status('Checking tablet');
       const cloud = await this.transport.list();
       const ids = new Set(cloud.map(d => d.id));
+      const blockedNotebooks = await this.notebookSync.preflight();
       for (const note of Object.values(this.state.notes)) {
         note.missing = (await this.host.read(note.path)) === null;
         if (note.missing) continue;
         for (const rev of note.revisions) {
           if (rev.superseded) continue;
+          if (rev.notebookId && blockedNotebooks.has(rev.notebookId)) continue;
           if (!ids.has(remoteId(rev))) continue; // Remote deletions never delete local text.
           await this.pull(note, rev);
         }
@@ -145,6 +147,7 @@ export class SyncEngine {
       const deferredLayouts: string[] = [];
       for (const note of Object.values(this.state.notes)) {
         if (mappingForFile(this.settings().notebookMappings ?? [], note.path)) continue;
+        if (note.revisions.some(rev => !rev.superseded && rev.notebookId && blockedNotebooks.has(rev.notebookId))) continue;
         if (note.date === 'notebook') continue;
         if (this.state.reviews.some(r => r.noteId === note.id)) continue;
         const text = await this.host.read(note.path);
@@ -186,6 +189,10 @@ export class SyncEngine {
       await this.recoverAppend();
       const note = this.noteByPath(file);
       if (!note) throw new Error('This note has not been enrolled. Run Sync now first.');
+      await this.notebookSync.recover();
+      const blockedNotebooks = await this.notebookSync.preflight();
+      const blocked = note.revisions.find(rev => !rev.superseded && rev.notebookId && blockedNotebooks.has(rev.notebookId));
+      if (blocked?.notebookId) throw new Error(this.state.notebooks[blocked.notebookId].pendingReason ?? 'Tablet notebook layout changed; the update is pending reconciliation.');
       // Pull every revision first so an explicit layout refresh includes the
       // latest cloud handwriting and cannot bypass a pending conflict review.
       const ids = new Set((await this.transport.list()).map(d => d.id));

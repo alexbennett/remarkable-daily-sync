@@ -48,6 +48,7 @@ export interface NotebookState {
   /** Lifecycle metadata only: never overrides the transport's notebook-write gate. */
   validation: 'pending' | 'validated';
   pendingReason?: string;
+  layoutConflict?: { fingerprint: string; archiveFile: string; reason: string };
 }
 export interface Revision {
   notebookId?: string; pageIds?: string[]; superseded?: boolean;

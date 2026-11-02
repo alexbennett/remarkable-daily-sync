@@ -92,6 +92,7 @@ async function setup(t: TestContext) {
   };
   return { controller, state, store, files, settings, callbacks, transport, host, archived, events, statuses, ink, remoteId, pdfKey, contentKey, addBlank, editContent, authorizedFormats,
     entries: () => { assert.ok(archive); return unzipSync(archive); }, stats: () => ({ uploads, writes, writeCalls }),
+    restoreEntries: (entries: Record<string, Uint8Array>) => { archive = zipSync(entries); },
     authorize: (value: boolean) => { authorized = value; }, fullEngine: () => { requireCallbackEvents = false; }, uninitialized: () => { initialized = false; }, legacy: () => { initialLegacy = true; }, unknown: () => { failUnknown = true; }, conflict: () => { conflict = true; } };
 }
 
@@ -137,7 +138,7 @@ test('unknown PDF-backed pages never gain an inferred source-note assignment', a
   s.files.set('Notes/A.md', 'updated alpha'); await s.controller.sync();
   assert.equal(s.stats().writes, 0); assert.equal(s.state.notebooks.book.generation, 1);
   assert.ok(s.entries()[unknown.key]);
-  assert.match(s.state.notebooks.book.pendingReason!, /mapping.*review/);
+  assert.match(s.state.notebooks.book.pendingReason!, /layout no longer matches/);
 });
 
 test('initialized legacy notebook updates the same document without inserting a native blank', async t => {
@@ -273,6 +274,42 @@ test('initial creation refuses a conflicting cloud title before upload', async t
   assert.match(s.state.notebooks.book.pendingReason!, /already exists/);
 });
 
+test('post-publication old layout rollback preserves archive and blocks recognition and writes durably', async t => {
+  const s = await setup(t); await s.controller.sync(); const old = s.entries();
+  s.files.set('Notes/A.md', 'saved latest note'); await s.controller.sync();
+  const accepted = s.entries(), generation = s.state.notebooks.book.generation;
+  const active = s.state.notes.a.revisions.at(-1)!, fingerprint = active.fingerprint;
+  const pulls = s.events.filter(e => e.startsWith('pull:')).length, calls = s.stats().writeCalls;
+  s.restoreEntries(old);
+  assert.deepEqual(await s.controller.preflight(), new Set(['book']));
+  const conflict = s.state.notebooks.book.layoutConflict!;
+  assert.ok(conflict); assert.ok((await s.store.read(conflict.archiveFile)).length);
+  assert.match(s.state.notebooks.book.pendingReason!, /close the notebook.*reconciliation/i);
+  await s.controller.sync();
+  assert.equal(s.events.filter(e => e.startsWith('pull:')).length, pulls); assert.equal(s.stats().writeCalls, calls);
+  assert.equal(s.files.get('Notes/A.md'), 'saved latest note'); assert.equal(active.fingerprint, fingerprint);
+  assert.equal(s.state.notebooks.book.generation, generation);
+  const loaded = await s.store.load();
+  const restarted = new NotebookSync(loaded, () => s.settings, s.host, s.store, s.transport, new NoteRenderer(), s.callbacks);
+  assert.deepEqual(await restarted.preflight(), new Set(['book']));
+  assert.equal(loaded.notebooks.book.layoutConflict!.archiveFile, conflict.archiveFile);
+  s.restoreEntries(accepted);
+  assert.deepEqual(await s.controller.preflight(), new Set());
+  assert.equal(s.state.notebooks.book.layoutConflict, undefined);
+});
+
+test('partial rollback during unknown publication preserves the pending journal and never retries overwrite', async t => {
+  const s = await setup(t); await s.controller.sync(); const before = s.entries();
+  s.files.set('Notes/A.md', 'new note'); s.unknown();
+  await assert.rejects(s.controller.sync(), /unknown response/);
+  const journal = await s.store.readText('pending-notebook.json'), partial = s.entries();
+  partial[s.pdfKey] = before[s.pdfKey]; s.restoreEntries(partial);
+  await s.controller.recover();
+  assert.equal(s.stats().writeCalls, 1); assert.equal(await s.store.readText('pending-notebook.json'), journal);
+  assert.ok(s.state.notebooks.book.layoutConflict); assert.equal(s.state.notebooks.book.generation, 1);
+  assert.equal(s.files.get('Notes/A.md'), 'new note');
+});
+
 test('mapping paused during upload verification cannot archive its old individual documents', async t => {
   const s = await setup(t);
   s.state.notes.a.revisions.push({ id: 'legacy', baseline: 'older', tabletText: 'older', name: 'legacy', blocks: [], pdfFile: 'old.pdf', archived: false, createdAt: '' });
@@ -316,6 +353,7 @@ test('full SyncEngine roundtrip routes handwritten edits by stable IDs after phy
   }) }) };
   const engine = new SyncEngine(s.state, () => s.settings, host, s.store, s.transport, renderer, recognizer, () => true);
   await engine.tick();
+  const initialCloudLayout = s.entries();
   const first = s.state.notes.a.revisions[0];
   s.ink('a', 'alpha', 'handwritten'); await engine.tick();
   assert.equal(s.files.get('Notes/A.md'), 'handwritten\n\noriginal');
@@ -329,6 +367,12 @@ test('full SyncEngine roundtrip routes handwritten edits by stable IDs after phy
   assert.ok(seen.every(item => item.page === item.blockPage));
   await engine.tick(); assert.equal(s.stats().writes, 2); assert.equal(seen.length, 2);
   assert.equal(s.stats().uploads, 1); assert.equal(await s.store.readText('pending-notebook.json'), null);
+  initialCloudLayout[`${s.remoteId}/${first.pageIds![0]}.rm`] = strToU8(JSON.stringify({ before: 'alpha', after: 'stale-device ink' }));
+  s.restoreEntries(initialCloudLayout);
+  await engine.tick();
+  assert.ok(s.state.notebooks.book.layoutConflict);
+  assert.equal(s.files.get('Notes/A.md'), 'second edit\n\noriginal');
+  assert.equal(s.stats().writes, 2); assert.equal(seen.length, 2, 'rollback must be detected before OCR');
 });
 
 test('removing a daily mapping publishes individual notes without archiving or renaming the shared notebook', async t => {

@@ -29,6 +29,10 @@ The user also confirmed that the existing Alpha page in the format-2 notebook wa
 
 A read-only USB export could still distinguish a stale local PDF from a local rendering-cache or page-metadata problem in the format-2 notebook. Cloud read-back alone cannot do that. No production compatibility evidence has been issued.
 
+The user subsequently observed that closing a document left open during an upload appeared to overwrite the update. A follow-up cloud read still contained the exact seven-page PDF and updated redirects from the last upload, so a cloud rollback has **not** yet been established as the cause of the display failure. A controlled test with the notebook closed before upload is required.
+
+Defensive detection now checks every published notebook's PDF and source-page mapping before OCR or another update. An unrecognized layout is preserved as a local conflict archive, imports and writes for that notebook stop, and source notes and pending journals remain intact. Tests cover a later stale layout after verified publication, partial layouts, restart persistence, and unknown-outcome recovery. This detects a changed cloud layout; it cannot detect an open tablet document or prevent a future device save.
+
 ## Remaining acceptance checks
 
 1. Resolve the blank-page/zoom failure and confirm updated pages display correctly on the tablet.
