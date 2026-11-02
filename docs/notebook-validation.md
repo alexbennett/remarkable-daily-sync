@@ -17,6 +17,14 @@ Cloud verification confirmed:
 
 This does not establish a root cause. A stale tablet PDF cache is a hypothesis, not a confirmed diagnosis. No guessed zoom, metadata, or size-field changes should be treated as a repair. Original annotated archives and the failed state are backed up locally outside the repository.
 
+Further physical checks:
+
+- Restarting the tablet did not resolve the mostly blank pages.
+- A separate fresh upload of the **exact same six-page PDF bytes** displayed all pages with text. This isolates the failure to the existing-document update path rather than the PDF's basic rendering compatibility.
+- Renaming the original document through the normal cloud operation refreshed its document metadata. All non-metadata archive members stayed byte-identical. The tablet still showed the 5.0x problem, including blank printed pages 2 and 5; page 3 was the intentionally blank page.
+
+The next diagnostic is a read-only USB export of the original disposable document. Compare its actual tablet PDF bytes with the original and updated cloud PDFs. A cloud read-back alone cannot distinguish a stale local PDF from a local rendering-cache or page-metadata problem. No production compatibility evidence has been issued.
+
 ## Remaining acceptance checks
 
 1. Resolve the blank-page/zoom failure and confirm updated pages display correctly on the tablet.
